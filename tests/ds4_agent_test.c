@@ -347,6 +347,165 @@ done:
     pthread_mutex_destroy(&w.mu);
 }
 
+/* --- sandbox subprocess: predicates and snapshots for the reader thread --- */
+
+static bool test_sandbox_out_at_least(void *ctx) {
+    size_t want = (size_t)(uintptr_t)ctx;
+    pthread_mutex_lock(&g_sandbox->mu);
+    bool ok = g_sandbox->out_len >= want;
+    pthread_mutex_unlock(&g_sandbox->mu);
+    return ok;
+}
+
+static bool test_sandbox_saw_stderr(void *ctx) {
+    pthread_mutex_lock(&g_sandbox->mu);
+    bool ok = g_sandbox->err_len > 0 &&
+              strstr(g_sandbox->err, (const char *)ctx) != NULL;
+    pthread_mutex_unlock(&g_sandbox->mu);
+    return ok;
+}
+
+static bool test_sandbox_is_dead(void *ctx) {
+    (void)ctx;
+    return g_sandbox && g_sandbox->dead;
+}
+
+static bool test_sandbox_wait(bool (*done)(void *), void *ctx, double timeout_sec) {
+    double start = now_sec();
+    while (now_sec() - start < timeout_sec) {
+        if (done(ctx)) return true;
+        usleep(5000);
+    }
+    return done(ctx);
+}
+
+static char *test_sandbox_snapshot_out(void) {
+    pthread_mutex_lock(&g_sandbox->mu);
+    char *copy = xstrdup(g_sandbox->out ? g_sandbox->out : "");
+    pthread_mutex_unlock(&g_sandbox->mu);
+    return copy;
+}
+
+static void test_sandbox_lifecycle(void) {
+    char err[512] = {0};
+
+    /* Every later step reads the handle, so a start that fails must end the
+     * test instead of falling through and dereferencing a NULL sandbox. */
+#define SB_START(cmd, trace)                                    \
+    do {                                                        \
+        if (!agent_sandbox_start((cmd), (trace), err, sizeof(err))) { \
+            fprintf(stderr, "sandbox start failed: %s\n", err); \
+            AGENT_TEST_ASSERT(!"sandbox start");                \
+            return;                                             \
+        }                                                       \
+    } while (0)
+
+    /* A command that cannot run must fail here, before the model is loaded,
+     * and must not leave a handle behind. */
+    AGENT_TEST_ASSERT(!agent_sandbox_start("ds4-no-such-command-xyz", NULL,
+                                           err, sizeof(err)));
+    AGENT_TEST_ASSERT(err[0] && strstr(err, "127"));
+    AGENT_TEST_ASSERT(g_sandbox == NULL);
+
+    /* stdin reaches the child and its stdout comes back. */
+    SB_START("cat", NULL);
+    write_all(g_sandbox->in_fd, "hello sandbox\n", 14);
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_out_at_least,
+                                       (void *)(uintptr_t)14, 5));
+    char *out = test_sandbox_snapshot_out();
+    AGENT_TEST_ASSERT(strstr(out, "hello sandbox"));
+    free(out);
+    agent_sandbox_stop();
+    AGENT_TEST_ASSERT(g_sandbox == NULL);
+
+    /* The environment is deliberately small but usable: the mode marker plus
+     * PATH so the command can find things.  The trailing exec keeps the
+     * sandbox alive past the startup grace window. */
+    SB_START("printf 'sb=[%s] path=[%s]\\n' \"$DS4_SANDBOX\" \"${PATH:-unset}\"; exec cat",
+             NULL);
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_out_at_least, (void *)(uintptr_t)1, 5));
+    out = test_sandbox_snapshot_out();
+    AGENT_TEST_ASSERT(strstr(out, "sb=[1]"));
+    AGENT_TEST_ASSERT(strstr(out, "path=[unset]") == NULL);
+    free(out);
+    agent_sandbox_stop();
+
+    /* stderr never reaches the response channel, but it is kept as a tail and
+     * reported when the sandbox goes away. */
+    SB_START("printf 'boom-on-stderr\\n' >&2; exec cat", NULL);
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_saw_stderr,
+                                       (void *)"boom-on-stderr", 5));
+    out = test_sandbox_snapshot_out();
+    AGENT_TEST_ASSERT(strstr(out, "boom-on-stderr") == NULL);
+    free(out);
+    kill(g_sandbox->pid, SIGKILL);
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_is_dead, NULL, 5));
+    char why[512] = {0};
+    AGENT_TEST_ASSERT(agent_sandbox_failed(why, sizeof(why)));
+    AGENT_TEST_ASSERT(strstr(why, "signal 9"));
+    AGENT_TEST_ASSERT(strstr(why, "boom-on-stderr"));
+    agent_sandbox_stop();
+    AGENT_TEST_ASSERT(g_sandbox == NULL);
+
+    /* A sandbox that ignores stdin EOF still goes down: the escalation from
+     * SIGTERM to SIGKILL bounds the wait. */
+    SB_START("sleep 30", NULL);
+    double start = now_sec();
+    agent_sandbox_stop();
+    AGENT_TEST_ASSERT(now_sec() - start < 4.0);
+    AGENT_TEST_ASSERT(g_sandbox == NULL);
+
+    /* With --trace the diagnostics land in a sibling file instead of the
+     * conversation. */
+    char dir[] = "/tmp/ds4-agent-sandbox-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    char trace[PATH_MAX], log[PATH_MAX];
+    snprintf(trace, sizeof(trace), "%s/trace", dir);
+    snprintf(log, sizeof(log), "%s/trace.sandbox.log", dir);
+    SB_START("printf 'to-trace-log\\n' >&2; exec cat", trace);
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_saw_stderr,
+                                       (void *)"to-trace-log", 5));
+    agent_sandbox_stop();
+    FILE *fp = fopen(log, "r");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char buf[256] = {0};
+        AGENT_TEST_ASSERT(fread(buf, 1, sizeof(buf) - 1, fp) > 0);
+        fclose(fp);
+        AGENT_TEST_ASSERT(strstr(buf, "to-trace-log"));
+    }
+    unlink(log);
+    unlink(trace);
+    rmdir(dir);
+#undef SB_START
+
+    /* An empty command is a usage error, not a child that dies instantly. */
+    pid_t child = fork();
+    AGENT_TEST_ASSERT(child >= 0);
+    if (child == 0) {
+        char *opts[] = {"ds4-agent", "--sandbox", "   "};
+        parse_options(3, opts);
+        _exit(0);
+    }
+    int status = 0;
+    if (child > 0) waitpid(child, &status, 0);
+    AGENT_TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 2);
+
+    child = fork();
+    AGENT_TEST_ASSERT(child >= 0);
+    if (child == 0) {
+        char *opts[] = {"ds4-agent", "--sandbox", "cat", "--sandbox", "cat"};
+        parse_options(5, opts);
+        _exit(0);
+    }
+    if (child > 0) waitpid(child, &status, 0);
+    AGENT_TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 2);
+
+    char *opts[] = {"ds4-agent", "--sandbox", "cat", "--non-interactive"};
+    agent_config cfg = parse_options(4, opts);
+    AGENT_TEST_ASSERT(cfg.sandbox_cmd && !strcmp(cfg.sandbox_cmd, "cat"));
+}
+
 static void test_completion(const char *text, linenoiseCompletions *completions) {
     (void)text;
     linenoiseAddCompletion(completions, "example");
@@ -1026,6 +1185,7 @@ int main(int argc, char **argv) {
     test_streaming_file_tools();
     test_shell_spawn();
     test_background_jobs();
+    test_sandbox_lifecycle();
     test_fragmented_terminal_input();
     test_shell_terminal_controls();
     test_markdown_literals();

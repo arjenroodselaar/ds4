@@ -89,6 +89,7 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     const char *chdir_path;
+    const char *sandbox_cmd;
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -896,6 +897,12 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--sandbox")) {
+            if (c.sandbox_cmd) {
+                fprintf(stderr, "ds4-agent: --sandbox may be given only once\n");
+                exit(2);
+            }
+            c.sandbox_cmd = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -998,6 +1005,12 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.gen.raw_prompt && c.gen.prefix.count != 0) {
         fprintf(stderr,
                 "ds4-agent: --prefix-file cannot be combined with --raw-prompt\n");
+        exit(2);
+    }
+    /* A blank command would spawn a shell that immediately exits, which the
+     * sandbox would then report as a death; reject it as a usage error. */
+    if (c.sandbox_cmd && !c.sandbox_cmd[strspn(c.sandbox_cmd, " \t\r\n")]) {
+        fprintf(stderr, "ds4-agent: --sandbox requires a command\n");
         exit(2);
     }
     return c;
@@ -9357,6 +9370,452 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 }
 
 /* ============================================================================
+ * Sandbox Subprocess
+ * ============================================================================
+ *
+ * --sandbox runs one long-lived child process for the whole agent run.  It is a
+ * property of the process rather than of a session, so the handle is a
+ * file-global and the child is started before the engine opens.  That ordering
+ * matters: /bin/sh always exists, so posix_spawn() succeeds even when the
+ * command itself cannot run, and the shell reports "not found" only a few
+ * milliseconds later.  Waiting out that window turns a minutes-long failure
+ * into an instant one.
+ *
+ * stdin stays open for requests and stdout carries responses.  stderr is the
+ * child's own diagnostics: the contract with a sandbox is that it folds the
+ * stderr of the work it performs into the result text it reports, so nothing
+ * out of band can reach the conversation.  Agent stderr is drained continuously,
+ * kept only as a short tail, mirrored to a sibling of --trace when that is set,
+ * and surfaced when the sandbox fails.
+ *
+ * The reader thread is not an optimization, it is what keeps the child from
+ * stalling: a pipe holds roughly 64 KiB, so a child that prints more than that
+ * while nobody reads blocks inside write().  Draining both pipes constantly is
+ * also what will make it safe to write a request synchronously: the child can
+ * never be stuck writing while the agent is stuck writing, which is the only
+ * way two pipes deadlock each other.
+ */
+
+#define AGENT_SANDBOX_OUT_MAX (4u * 1024u * 1024)
+#define AGENT_SANDBOX_ERR_TAIL 4096
+#define AGENT_SANDBOX_REPORT_BYTES 200
+#define AGENT_SANDBOX_ENV_VALUE 4096
+#define AGENT_SANDBOX_SPAWN_GRACE_SEC 0.25
+#define AGENT_SANDBOX_STOP_GRACE_SEC 1.0
+#define AGENT_SANDBOX_POLL_MS 50
+
+/* Mutable so posix_spawn() can take it without casting away const. */
+static char g_sandbox_mode_env[] = "DS4_SANDBOX=1";
+
+typedef struct {
+    pid_t pid;
+    int in_fd;          /* agent -> sandbox stdin, held open for requests */
+    int out_fd;         /* sandbox stdout: responses, drained continuously */
+    int err_fd;         /* sandbox stderr: diagnostics, never a response */
+    FILE *log;          /* sibling of --trace, NULL when tracing is off */
+    pthread_t reader;
+    bool reader_started;
+    pthread_mutex_t mu;
+    char *out;          /* response bytes not yet consumed by framing */
+    size_t out_len;
+    size_t out_cap;
+    char err[AGENT_SANDBOX_ERR_TAIL + 1];  /* newest stderr bytes */
+    size_t err_len;
+    bool err_truncated;
+    bool dead;          /* both pipes drained and the child reaped */
+    int exit_status;
+    char fault[128];    /* output could not be handled */
+} agent_sandbox;
+
+static agent_sandbox *g_sandbox;
+
+/* Declared here because the startup probe tears down a command that dies
+ * inside the grace window, before the teardown is defined below. */
+static void agent_sandbox_stop(void);
+
+static bool agent_sandbox_dead(agent_sandbox *sb) {
+    pthread_mutex_lock(&sb->mu);
+    bool dead = sb->dead;
+    pthread_mutex_unlock(&sb->mu);
+    return dead;
+}
+
+static void agent_sandbox_signal(agent_sandbox *sb, int sig) {
+    /* The shell is its own process group leader, so its grandchildren go down
+     * with it.  Never signal a reaped pid: it can be recycled to a process
+     * that has nothing to do with the sandbox. */
+    if (agent_sandbox_dead(sb)) return;
+    kill(-sb->pid, sig);
+    kill(sb->pid, sig);
+}
+
+/* mu held.  Keep only the newest bytes: stderr is diagnostics, and a chatty or
+ * looping sandbox must not be able to grow the agent's memory. */
+static void agent_sandbox_note_stderr(agent_sandbox *sb, const char *p, size_t n) {
+    const size_t keep = AGENT_SANDBOX_ERR_TAIL;
+    if (n >= keep) {
+        memcpy(sb->err, p + (n - keep), keep);
+        sb->err_len = keep;
+        sb->err_truncated = true;
+    } else {
+        if (sb->err_len + n > keep) {
+            size_t drop = sb->err_len + n - keep;
+            memmove(sb->err, sb->err + drop, sb->err_len - drop);
+            sb->err_len -= drop;
+            sb->err_truncated = true;
+        }
+        memcpy(sb->err + sb->err_len, p, n);
+        sb->err_len += n;
+    }
+    sb->err[sb->err_len] = '\0';
+}
+
+/* mu held.  Buffer response bytes until framing can consume them, and fault
+ * instead of growing without bound when nothing consumes them: an unreadable
+ * sandbox is torn down, an unbounded inbox would only move the crash. */
+static void agent_sandbox_note_stdout(agent_sandbox *sb, const char *p, size_t n) {
+    if (sb->fault[0]) return;
+    if (n > AGENT_SANDBOX_OUT_MAX - sb->out_len) {
+        snprintf(sb->fault, sizeof(sb->fault),
+                 "sandbox sent over %u bytes of unread output",
+                 AGENT_SANDBOX_OUT_MAX);
+        return;
+    }
+    if (sb->out_len + n + 1 > sb->out_cap) {
+        size_t cap = sb->out_cap ? sb->out_cap * 2 : 8192;
+        while (cap < sb->out_len + n + 1) cap *= 2;
+        sb->out = xrealloc(sb->out, cap);
+        sb->out_cap = cap;
+    }
+    memcpy(sb->out + sb->out_len, p, n);
+    sb->out_len += n;
+    sb->out[sb->out_len] = '\0';
+}
+
+/* Drains both pipes and reaps the child.  It never blocks on either: a detached
+ * descendant can keep a pipe open long after the shell exits, and blocking here
+ * would hang the teardown that the whole agent depends on. */
+static void *agent_sandbox_reader(void *arg) {
+    agent_sandbox *sb = arg;
+    char buf[8192];
+    bool out_eof = false, err_eof = false;
+    double eof_at = 0.0;
+    int status = 0;
+
+    for (;;) {
+        if (out_eof && err_eof) {
+            usleep(AGENT_SANDBOX_POLL_MS * 1000);
+        } else {
+            struct pollfd pfd[2];
+            nfds_t count = 0;
+            int which[2] = {0, 0};
+            if (!out_eof) {
+                pfd[count] = (struct pollfd){.fd = sb->out_fd, .events = POLLIN};
+                which[count++] = 0;
+            }
+            if (!err_eof) {
+                pfd[count] = (struct pollfd){.fd = sb->err_fd, .events = POLLIN};
+                which[count++] = 1;
+            }
+            int rc = poll(pfd, count, AGENT_SANDBOX_POLL_MS);
+            if (rc > 0) {
+                for (nfds_t i = 0; i < count; i++) {
+                    bool *eof = which[i] == 0 ? &out_eof : &err_eof;
+                    int fd = which[i] == 0 ? sb->out_fd : sb->err_fd;
+                    if (!(pfd[i].revents & POLLIN)) {
+                        if (pfd[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                            *eof = true;
+                            eof_at = now_sec();
+                        }
+                        continue;
+                    }
+                    ssize_t n = read(fd, buf, sizeof(buf));
+                    if (n > 0) {
+                        pthread_mutex_lock(&sb->mu);
+                        if (which[i] == 0) {
+                            agent_sandbox_note_stdout(sb, buf, (size_t)n);
+                        } else {
+                            agent_sandbox_note_stderr(sb, buf, (size_t)n);
+                            if (sb->log) {
+                                fwrite(buf, 1, (size_t)n, sb->log);
+                                fflush(sb->log);
+                            }
+                        }
+                        pthread_mutex_unlock(&sb->mu);
+                        continue;
+                    }
+                    if (n == 0) {
+                        *eof = true;
+                        eof_at = now_sec();
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EINTR) continue;
+                    pthread_mutex_lock(&sb->mu);
+                    if (!sb->fault[0])
+                        snprintf(sb->fault, sizeof(sb->fault),
+                                 "sandbox output read failed: %s", strerror(errno));
+                    pthread_mutex_unlock(&sb->mu);
+                    *eof = true;
+                    eof_at = now_sec();
+                }
+            } else if (rc < 0 && errno != EINTR) {
+                pthread_mutex_lock(&sb->mu);
+                if (!sb->fault[0])
+                    snprintf(sb->fault, sizeof(sb->fault),
+                             "sandbox pipe poll failed: %s", strerror(errno));
+                pthread_mutex_unlock(&sb->mu);
+                out_eof = err_eof = true;
+                eof_at = now_sec();
+            }
+        }
+
+        pid_t rc = waitpid(sb->pid, &status, WNOHANG);
+        if (rc > 0 || (rc < 0 && errno == ECHILD)) break;
+        if (out_eof && err_eof &&
+            now_sec() - eof_at >= AGENT_SANDBOX_STOP_GRACE_SEC) {
+            /* EOF on both pipes with a live child means a descendant inherited
+             * and kept them open.  Nothing more can ever be read, so end the
+             * group rather than wait for it. */
+            kill(-sb->pid, SIGKILL);
+            kill(sb->pid, SIGKILL);
+            while (waitpid(sb->pid, &status, 0) < 0 && errno == EINTR) {}
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&sb->mu);
+    sb->exit_status = status;
+    sb->dead = true;
+    pthread_mutex_unlock(&sb->mu);
+    return NULL;
+}
+
+/* Why the sandbox is unusable: exit status or signal, plus the newest stderr
+ * bytes, which is where a shell reports that the command does not exist. */
+static void agent_sandbox_reason(agent_sandbox *sb, char *out, size_t outlen) {
+    char base[160];
+    char detail[AGENT_SANDBOX_REPORT_BYTES + 8];
+    size_t n = 0;
+
+    pthread_mutex_lock(&sb->mu);
+    if (sb->fault[0]) snprintf(base, sizeof(base), "%s", sb->fault);
+    else if (WIFSIGNALED(sb->exit_status))
+        snprintf(base, sizeof(base), "killed by signal %d", WTERMSIG(sb->exit_status));
+    else if (WIFEXITED(sb->exit_status))
+        snprintf(base, sizeof(base), "exited with status %d",
+                 WEXITSTATUS(sb->exit_status));
+    else snprintf(base, sizeof(base), "closed its output");
+    if (sb->err_len) {
+        if (sb->err_truncated) {
+            memcpy(detail, "...", 3);
+            n = 3;
+        }
+        for (size_t i = 0; i < sb->err_len && n + 2 < sizeof(detail); i++) {
+            unsigned char c = (unsigned char)sb->err[i];
+            /* The reason goes to a terminal as one line, so line breaks become
+             * spaces; other bytes pass through so UTF-8 stays readable. */
+            if (c == '\t' || c == '\n' || c == '\r') detail[n++] = ' ';
+            else if (c < 32 || c == 127) detail[n++] = '?';
+            else detail[n++] = (char)c;
+        }
+        detail[n] = '\0';
+    }
+    pthread_mutex_unlock(&sb->mu);
+
+    if (n) snprintf(out, outlen, "%s; stderr: %s", base, detail);
+    else snprintf(out, outlen, "%s", base);
+}
+
+/* True when the sandbox can no longer serve requests.  Both run loops treat
+ * that as the end of the session: a sandbox that is gone is not a sandbox, and
+ * continuing without one would be the one failure mode this mode exists to
+ * prevent. */
+static bool agent_sandbox_failed(char *why, size_t whylen) {
+    agent_sandbox *sb = g_sandbox;
+    if (!sb) return false;
+    pthread_mutex_lock(&sb->mu);
+    bool failed = sb->dead || sb->fault[0] != '\0';
+    pthread_mutex_unlock(&sb->mu);
+    if (!failed) return false;
+    agent_sandbox_reason(sb, why, whylen);
+    return true;
+}
+
+/* The sandbox command needs enough environment to find and run things; anything
+ * beyond that is the sandbox's own business to sanitize. */
+static size_t agent_sandbox_env_add(char *env[], size_t envc, char *slot,
+                                    size_t slot_len, const char *name) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return envc;
+    int written = snprintf(slot, slot_len, "%s=%s", name, value);
+    if (written < 0 || (size_t)written >= slot_len) return envc;
+    env[envc] = slot;
+    return envc + 1;
+}
+
+/* The agent can be started with its own stdio closed, in which case pipe()
+ * hands back descriptors in the standard range and the dup2 actions below
+ * would overwrite each other.  Keep every sandbox descriptor above fd 2. */
+static int agent_sandbox_move_above(int fd, int *moved) {
+    if (fd > STDERR_FILENO) {
+        *moved = fd;
+        return 0;
+    }
+    int high = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (high < 0) return errno;
+    close(fd);
+    *moved = high;
+    return 0;
+}
+
+static int agent_sandbox_spawn(pid_t *pid, const int in[2], const int out[2],
+                               const int err[2], const char *cmd) {
+    char path_slot[AGENT_SANDBOX_ENV_VALUE], home_slot[AGENT_SANDBOX_ENV_VALUE];
+    char tmp_slot[AGENT_SANDBOX_ENV_VALUE];
+    char *env[5];
+    size_t envc = 0;
+    env[envc++] = g_sandbox_mode_env;
+    envc = agent_sandbox_env_add(env, envc, path_slot, sizeof(path_slot), "PATH");
+    envc = agent_sandbox_env_add(env, envc, home_slot, sizeof(home_slot), "HOME");
+    envc = agent_sandbox_env_add(env, envc, tmp_slot, sizeof(tmp_slot), "TMPDIR");
+    env[envc] = NULL;
+
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawnattr_init(&attr);
+    if (rc) return rc;
+    rc = posix_spawn_file_actions_init(&actions);
+    if (rc) {
+        posix_spawnattr_destroy(&attr);
+        return rc;
+    }
+    rc = posix_spawnattr_setpgroup(&attr, 0);
+    if (!rc) rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    if (!rc) rc = posix_spawn_file_actions_addclose(&actions, in[1]);
+    if (!rc) rc = posix_spawn_file_actions_addclose(&actions, out[0]);
+    if (!rc) rc = posix_spawn_file_actions_addclose(&actions, err[0]);
+    if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, in[0], STDIN_FILENO);
+    if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
+    if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
+    if (!rc) rc = posix_spawn_file_actions_addclose(&actions, in[0]);
+
+    /* Same shape as the bash tool: the shell parses the command line, so the
+     * flag can carry pipelines and redirections. */
+    char *argv[] = {"sh", "-c", (char *)(cmd ? cmd : ""), "sh", NULL};
+    if (!rc) rc = posix_spawn(pid, "/bin/sh", &actions, &attr, argv, env);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+    return rc;
+}
+
+/* Starts the sandbox, or fills err and returns false.  A command that cannot
+ * run is reported here rather than later: /bin/sh exits 127 within a few
+ * milliseconds, and this runs before the model is loaded. */
+static bool agent_sandbox_start(const char *cmd, const char *trace_path,
+                                char *err, size_t errlen) {
+    int in[2] = {-1, -1}, out[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+    if (pipe(in) != 0) {
+        snprintf(err, errlen, "sandbox stdin pipe failed: %s", strerror(errno));
+        return false;
+    }
+    if (pipe(out) != 0 || pipe(err_pipe) != 0) {
+        snprintf(err, errlen, "sandbox output pipe failed: %s", strerror(errno));
+        close(in[0]); close(in[1]);
+        close(out[0]); close(out[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        return false;
+    }
+
+    agent_sandbox *sb = xmalloc(sizeof(*sb));
+    memset(sb, 0, sizeof(*sb));
+    pthread_mutex_init(&sb->mu, NULL);
+    sb->in_fd = sb->out_fd = sb->err_fd = -1;
+    int rc = agent_sandbox_move_above(in[0], &in[0]) ||
+             agent_sandbox_move_above(in[1], &in[1]) ||
+             agent_sandbox_move_above(out[0], &out[0]) ||
+             agent_sandbox_move_above(out[1], &out[1]) ||
+             agent_sandbox_move_above(err_pipe[0], &err_pipe[0]) ||
+             agent_sandbox_move_above(err_pipe[1], &err_pipe[1]);
+
+    if (trace_path && trace_path[0]) {
+        char log_path[PATH_MAX];
+        snprintf(log_path, sizeof(log_path), "%s.sandbox.log", trace_path);
+        sb->log = fopen(log_path, "a");
+    }
+    if (!rc) rc = agent_sandbox_spawn(&sb->pid, in, out, err_pipe, cmd);
+    close(in[0]);
+    close(out[1]);
+    close(err_pipe[1]);
+    if (rc) {
+        snprintf(err, errlen, "failed to spawn sandbox: %s", strerror(rc));
+        close(in[1]); close(out[0]); close(err_pipe[0]);
+        if (sb->log) fclose(sb->log);
+        pthread_mutex_destroy(&sb->mu);
+        free(sb);
+        return false;
+    }
+    sb->in_fd = in[1];
+    sb->out_fd = out[0];
+    sb->err_fd = err_pipe[0];
+    set_nonblock(sb->out_fd, true, NULL);
+    set_nonblock(sb->err_fd, true, NULL);
+
+    rc = pthread_create(&sb->reader, NULL, agent_sandbox_reader, sb);
+    if (rc) {
+        snprintf(err, errlen, "failed to read sandbox output: %s", strerror(rc));
+        kill(-sb->pid, SIGKILL);
+        kill(sb->pid, SIGKILL);
+        while (waitpid(sb->pid, NULL, 0) < 0 && errno == EINTR) {}
+        close(in[1]); close(out[0]); close(err_pipe[0]);
+        if (sb->log) fclose(sb->log);
+        pthread_mutex_destroy(&sb->mu);
+        free(sb);
+        return false;
+    }
+    sb->reader_started = true;
+    g_sandbox = sb;
+
+    double deadline = now_sec() + AGENT_SANDBOX_SPAWN_GRACE_SEC;
+    while (!agent_sandbox_dead(sb) && now_sec() < deadline) usleep(10000);
+    if (agent_sandbox_dead(sb)) {
+        char why[512];
+        agent_sandbox_reason(sb, why, sizeof(why));
+        snprintf(err, errlen, "sandbox command failed: %s", why);
+        agent_sandbox_stop();
+        return false;
+    }
+    return true;
+}
+
+/* Closes the sandbox.  Ending its stdin lets a well-behaved command finish by
+ * itself; after that the process group is escalated exactly like a long-running
+ * bash job.  Registered with atexit() because the REPL leaves through exit() on
+ * the paths that skip main's cleanup. */
+static void agent_sandbox_stop(void) {
+    agent_sandbox *sb = g_sandbox;
+    if (!sb) return;
+    g_sandbox = NULL;
+    if (sb->in_fd >= 0) {
+        close(sb->in_fd);
+        sb->in_fd = -1;
+    }
+    if (!agent_sandbox_dead(sb)) agent_sandbox_signal(sb, SIGTERM);
+    double deadline = now_sec() + AGENT_SANDBOX_STOP_GRACE_SEC;
+    while (!agent_sandbox_dead(sb) && now_sec() < deadline) usleep(10000);
+    if (!agent_sandbox_dead(sb)) agent_sandbox_signal(sb, SIGKILL);
+    deadline = now_sec() + AGENT_SANDBOX_STOP_GRACE_SEC;
+    while (!agent_sandbox_dead(sb) && now_sec() < deadline) usleep(10000);
+
+    if (sb->reader_started) pthread_join(sb->reader, NULL);
+    if (sb->out_fd >= 0) close(sb->out_fd);
+    if (sb->err_fd >= 0) close(sb->err_fd);
+    if (sb->log) fclose(sb->log);
+    free(sb->out);
+    pthread_mutex_destroy(&sb->mu);
+    free(sb);
+}
+
+/* ============================================================================
  * Tool Dispatch
  * ============================================================================
  */
@@ -12992,6 +13451,17 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             break;
         }
 
+        /* There is no prompt to ask "save the session?" in this mode, so a lost
+         * sandbox is reported and the process leaves; atexit() closes it. */
+        if (cfg->sandbox_cmd) {
+            char why[512];
+            if (agent_sandbox_failed(why, sizeof(why))) {
+                fprintf(stderr, "ds4-agent: sandbox exited: %s\n", why);
+                rc = 1;
+                break;
+            }
+        }
+
         if (!one_shot && input.len > 0 &&
             (stdin_eof || now_sec() >= quiet_deadline))
         {
@@ -13075,10 +13545,35 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
     bool running = true;
     bool exit_save_handled = false;
+    bool sandbox_exit_handled = false;
     bool show_welcome_after_restart = false;
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
     while (running) {
+        /* The sandbox is the boundary everything else runs behind, so losing it
+         * ends the session the same way /exit does: stop the editor first, then
+         * give the user the chance to keep the transcript.  Reported once; a
+         * user who cancels after a failed save keeps the prompt they chose. */
+        if (cfg->sandbox_cmd && !sandbox_exit_handled) {
+            char why[512];
+            if (agent_sandbox_failed(why, sizeof(why))) {
+                sandbox_exit_handled = true;
+                editor_stop(&editor);
+                editor_restore_terminal_layout(&editor);
+                agent_sandbox_stop();
+                printf("sandbox exited: %s\n", why);
+                fflush(stdout);
+                agent_exit_save_result exit_save =
+                    agent_maybe_save_before_exiting(&worker);
+                if (exit_save == AGENT_EXIT_NOW) exit(0);
+                if (exit_save == AGENT_EXIT_CLEAN) {
+                    exit_save_handled = true;
+                    running = false;
+                } else {
+                    editor_start(&editor, prompt, statusline, NULL);
+                }
+            }
+        }
         /* If a bash child process changed the terminal mode (e.g., from raw
          * to cooked), restore raw mode so linenoise continues to work. */
         if (worker_check_raw_mode_restore(&worker)) {
@@ -13525,6 +14020,18 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-agent: %s is not a directory\n",
                     cfg.chdir_path);
             return 1;
+        }
+    }
+    if (cfg.sandbox_cmd) {
+        char sb_err[512] = {0};
+        /* Registered before the start so the handler is installed no matter how
+         * the process leaves, including the REPL paths that call exit() and
+         * this one's own failure return. */
+        atexit(agent_sandbox_stop);
+        if (!agent_sandbox_start(cfg.sandbox_cmd, cfg.gen.trace_path,
+                                 sb_err, sizeof(sb_err))) {
+            fprintf(stderr, "ds4-agent: %s\n", sb_err);
+            return 2;
         }
     }
     cfg.engine.context_size = cfg.gen.ctx_size;
