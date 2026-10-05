@@ -3,6 +3,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_json.h"
 #include "ds4_kvstore.h"
 #include "ds4_prompt_prefix.h"
 #include "ds4_tp.h"
@@ -9397,12 +9398,15 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
  */
 
 #define AGENT_SANDBOX_OUT_MAX (4u * 1024u * 1024)
+#define AGENT_SANDBOX_REQ_MAX (1024u * 1024)
+#define AGENT_SANDBOX_HEADER_MAX 32
 #define AGENT_SANDBOX_ERR_TAIL 4096
 #define AGENT_SANDBOX_REPORT_BYTES 200
 #define AGENT_SANDBOX_ENV_VALUE 4096
 #define AGENT_SANDBOX_SPAWN_GRACE_SEC 0.25
 #define AGENT_SANDBOX_STOP_GRACE_SEC 1.0
 #define AGENT_SANDBOX_POLL_MS 50
+#define AGENT_SANDBOX_WAIT_MS 5
 
 /* Mutable so posix_spawn() can take it without casting away const. */
 static char g_sandbox_mode_env[] = "DS4_SANDBOX=1";
@@ -9416,9 +9420,15 @@ typedef struct {
     pthread_t reader;
     bool reader_started;
     pthread_mutex_t mu;
-    char *out;          /* response bytes not yet consumed by framing */
+    char *out;          /* stdout bytes not yet consumed by framing */
     size_t out_len;
     size_t out_cap;
+    unsigned long long skip;    /* bytes of an over-ceiling frame still to drop */
+    long long next_id;          /* request ids start at 1; 0 means a notice */
+    long long want_id;          /* id being waited on, 0 when nothing is */
+    bool answered;              /* the reader has filled the answer below */
+    bool answer_ok;
+    char *answer;               /* malloc'd text, taken by the requester */
     char err[AGENT_SANDBOX_ERR_TAIL + 1];  /* newest stderr bytes */
     size_t err_len;
     bool err_truncated;
@@ -9432,6 +9442,8 @@ static agent_sandbox *g_sandbox;
 /* Declared here because the startup probe tears down a command that dies
  * inside the grace window, before the teardown is defined below. */
 static void agent_sandbox_stop(void);
+/* Also used while buffering stdout, before the framing code that defines it. */
+static void agent_sandbox_fault(agent_sandbox *sb, const char *fmt, ...);
 
 static bool agent_sandbox_dead(agent_sandbox *sb) {
     pthread_mutex_lock(&sb->mu);
@@ -9476,9 +9488,8 @@ static void agent_sandbox_note_stderr(agent_sandbox *sb, const char *p, size_t n
 static void agent_sandbox_note_stdout(agent_sandbox *sb, const char *p, size_t n) {
     if (sb->fault[0]) return;
     if (n > AGENT_SANDBOX_OUT_MAX - sb->out_len) {
-        snprintf(sb->fault, sizeof(sb->fault),
-                 "sandbox sent over %u bytes of unread output",
-                 AGENT_SANDBOX_OUT_MAX);
+        agent_sandbox_fault(sb, "sandbox sent over %u bytes without a whole frame",
+                            AGENT_SANDBOX_OUT_MAX);
         return;
     }
     if (sb->out_len + n + 1 > sb->out_cap) {
@@ -9490,6 +9501,193 @@ static void agent_sandbox_note_stdout(agent_sandbox *sb, const char *p, size_t n
     memcpy(sb->out + sb->out_len, p, n);
     sb->out_len += n;
     sb->out[sb->out_len] = '\0';
+}
+
+/* mu held.  Hand text to whoever is waiting.  The text is ownership-transferred
+ * and becomes whatever the caller is told, sandbox fault or not. */
+static void agent_sandbox_answer(agent_sandbox *sb, bool ok, char *text) {
+    free(sb->answer);
+    sb->answer = text;
+    sb->answer_ok = ok;
+    sb->answered = true;
+    sb->want_id = 0;
+}
+
+/* mu held.  The protocol is not negotiable: a sandbox that cannot keep its
+ * stdout to whole frames cannot be talked to, and there is no resynchronisation
+ * marker to look for, so guessing where the next frame starts would invent
+ * tool results.  A fault ends the session, and it ends any wait on the way: a
+ * sandbox that prints garbage and then waits for a request would otherwise hang
+ * the caller until the teardown. */
+static void agent_sandbox_fault(agent_sandbox *sb, const char *fmt, ...) {
+    if (sb->fault[0]) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(sb->fault, sizeof(sb->fault), fmt, ap);
+    va_end(ap);
+    if (sb->want_id) agent_sandbox_answer(sb, false, xstrdup(sb->fault));
+}
+
+/* mu held.  Drop the oldest stdout bytes. */
+static void agent_sandbox_consume(agent_sandbox *sb, size_t n) {
+    if (n >= sb->out_len) {
+        sb->out_len = 0;
+        if (sb->out) sb->out[0] = '\0';
+        return;
+    }
+    memmove(sb->out, sb->out + n, sb->out_len - n);
+    sb->out_len -= n;
+    sb->out[sb->out_len] = '\0';
+}
+
+/* A frame header is a decimal byte count and a newline: 1 to 20 digits, no
+ * sign, and at least one byte of payload.  Twenty digits cannot overflow an
+ * unsigned long long, so the parse needs no overflow check.  Anything else is
+ * not a partial read: a stray character can never become a valid count later. */
+static bool agent_sandbox_parse_header(const char *p, size_t len,
+                                       unsigned long long *count) {
+    if (len == 0 || len > 20) return false;
+    unsigned long long v = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] < '0' || p[i] > '9') return false;
+        v = v * 10ull + (unsigned long long)(p[i] - '0');
+    }
+    if (v == 0) return false;
+    *count = v;
+    return true;
+}
+
+/* mu held, and the reader thread is the only writer of the log.  A notice tells
+ * the reader of the trace something about the sandbox; it is diagnostics, so it
+ * lives where the sandbox's stderr already lives and does not exist at all
+ * without --trace. */
+static void agent_sandbox_log_notice(agent_sandbox *sb, const char *text) {
+    if (!sb->log) return;
+    fprintf(sb->log, "sandbox log: %s\n", text ? text : "");
+    fflush(sb->log);
+}
+
+/* mu held.  One payload is either the answer to the single request in flight or
+ * a notice about the sandbox.  Members nobody asked for are ignored, which is
+ * what lets a sandbox grow its protocol without breaking an older agent. */
+static void agent_sandbox_handle_frame(agent_sandbox *sb, const char *payload,
+                                       size_t len) {
+    char *doc = xmalloc(len + 1);
+    memcpy(doc, payload, len);
+    doc[len] = '\0';
+
+    json_args args = {0};
+    if (!json_args_parse(doc, &args)) {
+        free(doc);
+        agent_sandbox_fault(sb, "sandbox sent a frame that is not a JSON object");
+        return;
+    }
+
+    int id_idx = json_args_find_unused(&args, "id");
+    const char *id_text = id_idx >= 0 && !args.v[id_idx].is_string ?
+                          args.v[id_idx].value : NULL;
+    bool id_valid = id_text && id_text[0];
+    if (id_text) {
+        for (const char *c = id_text; *c; c++)
+            if (*c < '0' || *c > '9') id_valid = false;
+    }
+    if (!id_valid) {
+        json_args_free(&args);
+        free(doc);
+        agent_sandbox_fault(sb, "sandbox frame has no numeric id");
+        return;
+    }
+    args.v[id_idx].used = true;
+    long long id = strtoll(id_text, NULL, 10);
+
+    if (id == 0) {
+        int text_idx = json_args_find_unused(&args, "text");
+        agent_sandbox_log_notice(sb, text_idx >= 0 ? args.v[text_idx].value : doc);
+        json_args_free(&args);
+        free(doc);
+        return;
+    }
+
+    /* Nobody is waiting for this id: it belongs to a request the user
+     * interrupted, or to a sandbox that answers twice.  Either way it must not
+     * be handed to a later call, and it is not worth ending the session over. */
+    if (id != sb->want_id) {
+        json_args_free(&args);
+        free(doc);
+        return;
+    }
+
+    int ok_idx = json_args_find_unused(&args, "ok");
+    const char *ok_text = ok_idx >= 0 && !args.v[ok_idx].is_string ?
+                          args.v[ok_idx].value : NULL;
+    if (!ok_text || (strcmp(ok_text, "true") && strcmp(ok_text, "false"))) {
+        json_args_free(&args);
+        free(doc);
+        agent_sandbox_fault(sb, "sandbox response has no boolean ok");
+        return;
+    }
+    args.v[ok_idx].used = true;
+    bool ok = !strcmp(ok_text, "true");
+
+    int text_idx = json_args_find_unused(&args, ok ? "result" : "error");
+    char *text;
+    if (text_idx >= 0 && args.v[text_idx].is_string) {
+        text = args.v[text_idx].value;
+        args.v[text_idx].value = NULL;
+    } else {
+        text = xstrdup(ok ? "" : "sandbox reported a failure without a reason");
+    }
+    json_args_free(&args);
+    free(doc);
+    agent_sandbox_answer(sb, ok, text);
+}
+
+/* mu held.  Turn whatever stdout has delivered into whole frames.  The loop
+ * runs until the buffer holds less than one frame, which is the normal state
+ * between and during responses. */
+static void agent_sandbox_frames(agent_sandbox *sb) {
+    for (;;) {
+        if (sb->fault[0]) return;
+
+        /* An over-ceiling frame is counted out of the stream rather than
+         * buffered: the header says exactly how much to drop, so the stream
+         * stays readable and only the call that was answered fails. */
+        if (sb->skip) {
+            size_t drop = sb->skip < sb->out_len ? (size_t)sb->skip : sb->out_len;
+            if (drop) {
+                agent_sandbox_consume(sb, drop);
+                sb->skip -= drop;
+            }
+            if (sb->skip) return;
+            continue;
+        }
+
+        if (!sb->out_len) return;
+        const char *nl = memchr(sb->out, '\n', sb->out_len);
+        if (!nl) {
+            if (sb->out_len >= AGENT_SANDBOX_HEADER_MAX)
+                agent_sandbox_fault(sb, "sandbox frame header is over %d bytes",
+                                    AGENT_SANDBOX_HEADER_MAX);
+            return;
+        }
+        size_t header = (size_t)(nl - sb->out);
+        unsigned long long count = 0;
+        if (!agent_sandbox_parse_header(sb->out, header, &count)) {
+            agent_sandbox_fault(sb, "sandbox frame header is not a byte count");
+            return;
+        }
+        if (count > AGENT_SANDBOX_OUT_MAX) {
+            if (sb->want_id)
+                agent_sandbox_answer(sb, false,
+                                     xstrdup("sandbox response was too large"));
+            sb->skip = count;
+            agent_sandbox_consume(sb, header + 1);
+            continue;
+        }
+        if (sb->out_len < header + 1 + (size_t)count) return;
+        agent_sandbox_handle_frame(sb, sb->out + header + 1, (size_t)count);
+        agent_sandbox_consume(sb, header + 1 + (size_t)count);
+    }
 }
 
 /* Drains both pipes and reaps the child.  It never blocks on either: a detached
@@ -9534,6 +9732,7 @@ static void *agent_sandbox_reader(void *arg) {
                         pthread_mutex_lock(&sb->mu);
                         if (which[i] == 0) {
                             agent_sandbox_note_stdout(sb, buf, (size_t)n);
+                            agent_sandbox_frames(sb);
                         } else {
                             agent_sandbox_note_stderr(sb, buf, (size_t)n);
                             if (sb->log) {
@@ -9649,6 +9848,163 @@ static bool agent_sandbox_report_loss(int *rc) {
     fprintf(stderr, "ds4-agent: sandbox exited: %s\n", why);
     *rc = 1;
     return true;
+}
+
+/* mu NOT held.  A frame leaves as one blocking write, header first.  That is
+ * safe in both directions by construction: the request is capped, the reader
+ * thread is always draining the child's stdout, and the sandbox is required to
+ * read its stdin, so neither side can be stuck writing while the other is stuck
+ * writing.  A sandbox that has already gone shows up as EPIPE because SIGPIPE is
+ * ignored, which is what makes this failure reportable rather than fatal. */
+static bool agent_sandbox_write_frame(agent_sandbox *sb, const char *json,
+                                      size_t len, char *err, size_t errlen) {
+    char header[AGENT_SANDBOX_HEADER_MAX];
+    int hn = snprintf(header, sizeof(header), "%llu\n", (unsigned long long)len);
+    if (hn <= 0 || (size_t)hn >= sizeof(header)) {
+        snprintf(err, errlen, "sandbox request is too large to count");
+        return false;
+    }
+
+    const char *part[2] = { header, json };
+    size_t left[2] = { (size_t)hn, len };
+    /* in_fd is non-blocking, so a sandbox that is alive but not reading gets a
+     * bounded wait instead of an EAGAIN that looks like a lost request.  Once the
+     * child is gone the write ends with EPIPE, which is an error to report because
+     * SIGPIPE is ignored. */
+    double give_up = now_sec() + 10.0;
+    for (int i = 0; i < 2; i++) {
+        const char *p = part[i];
+        while (left[i]) {
+            ssize_t wr = write(sb->in_fd, p, left[i]);
+            if (wr > 0) {
+                p += wr;
+                left[i] -= (size_t)wr;
+                continue;
+            }
+            if (wr < 0 && errno == EINTR) continue;
+            if (wr < 0 && errno == EAGAIN && !agent_sandbox_failed(NULL, 0) &&
+                now_sec() < give_up) {
+                usleep(2000);
+                continue;
+            }
+            snprintf(err, errlen, "sandbox request write failed: %s",
+                     wr < 0 ? strerror(errno) : "wrote nothing");
+            return false;
+        }
+    }
+    return true;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define DS4_AGENT_MAYBE_UNUSED __attribute__((unused))
+#else
+#define DS4_AGENT_MAYBE_UNUSED
+#endif
+
+/* Runs one request in the sandbox and returns the text to report for it, true
+ * when the sandbox reported success.  Exactly one request is in flight: args_json
+ * is the already-encoded {"k":"v",...} object, and the answer must carry the id
+ * this call chose.  The wait is interruptible through the worker, and an
+ * interrupted request abandons its id, so the answer that arrives later is
+ * dropped instead of being reported for whatever is asked next.
+ *
+ * Marked unused because the caller is the tool routing that follows: nothing in
+ * the agent can ask a sandbox for a tool result until that exists. */
+static DS4_AGENT_MAYBE_UNUSED bool agent_sandbox_request(const char *tool,
+                                                         const char *args_json,
+                                                         agent_worker *w,
+                                                         char **text) {
+    agent_sandbox *sb = g_sandbox;
+    if (!sb) {
+        *text = xstrdup("no sandbox is running");
+        return false;
+    }
+
+    /* The id is reserved before the frame is built so that two callers cannot
+     * share the counter, and so that a failure below always has a pending
+     * request to release. */
+    pthread_mutex_lock(&sb->mu);
+    if (sb->dead || sb->fault[0]) {
+        pthread_mutex_unlock(&sb->mu);
+        char why[256];
+        *text = xstrdup(agent_sandbox_failed(why, sizeof(why)) ? why
+                                                               : "sandbox is gone");
+        return false;
+    }
+    if (sb->want_id) {
+        pthread_mutex_unlock(&sb->mu);
+        *text = xstrdup("sandbox is already running a request");
+        return false;
+    }
+    long long id = ++sb->next_id;
+    sb->want_id = id;
+    sb->answered = false;
+    sb->answer_ok = false;
+    free(sb->answer);
+    sb->answer = NULL;
+    pthread_mutex_unlock(&sb->mu);
+
+    buf body = {0};
+    buf_printf(&body, "{\"id\":%lld,\"tool\":", id);
+    json_escape(&body, tool);
+    buf_puts(&body, ",\"args\":");
+    buf_puts(&body, args_json && args_json[0] ? args_json : "{}");
+    buf_putc(&body, '}');
+    char *frame = buf_take(&body);
+    size_t len = strlen(frame);
+
+    /* A request that cannot fit is the model's mistake, not the sandbox's: the
+     * session and the sandbox both stay up. */
+    if (len > AGENT_SANDBOX_REQ_MAX) {
+        free(frame);
+        pthread_mutex_lock(&sb->mu);
+        sb->want_id = 0;
+        pthread_mutex_unlock(&sb->mu);
+        *text = xstrdup("request is too large for the sandbox");
+        return false;
+    }
+
+    char err[160] = {0};
+    bool wrote = agent_sandbox_write_frame(sb, frame, len, err, sizeof(err));
+    free(frame);
+    if (!wrote) {
+        pthread_mutex_lock(&sb->mu);
+        if (sb->want_id == id) sb->want_id = 0;
+        pthread_mutex_unlock(&sb->mu);
+        *text = xstrdup(err);
+        return false;
+    }
+
+    for (;;) {
+        pthread_mutex_lock(&sb->mu);
+        if (sb->answered) {
+            *text = sb->answer;
+            sb->answer = NULL;
+            bool ok = sb->answer_ok;
+            sb->answered = false;
+            pthread_mutex_unlock(&sb->mu);
+            return ok;
+        }
+        pthread_mutex_unlock(&sb->mu);
+
+        if (w && worker_should_interrupt(w)) {
+            pthread_mutex_lock(&sb->mu);
+            if (sb->want_id == id) sb->want_id = 0;
+            pthread_mutex_unlock(&sb->mu);
+            *text = xstrdup("interrupted before the sandbox answered");
+            return false;
+        }
+
+        char why[256];
+        if (agent_sandbox_failed(why, sizeof(why))) {
+            pthread_mutex_lock(&sb->mu);
+            if (sb->want_id == id) sb->want_id = 0;
+            pthread_mutex_unlock(&sb->mu);
+            *text = xstrdup(why);
+            return false;
+        }
+        usleep(AGENT_SANDBOX_WAIT_MS * 1000);
+    }
 }
 
 /* The sandbox command needs enough environment to find and run things; anything
@@ -9826,6 +10182,7 @@ static void agent_sandbox_stop(void) {
     if (sb->err_fd >= 0) close(sb->err_fd);
     if (sb->log) fclose(sb->log);
     free(sb->out);
+    free(sb->answer);
     pthread_mutex_destroy(&sb->mu);
     free(sb);
 }

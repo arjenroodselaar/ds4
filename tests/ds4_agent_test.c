@@ -349,14 +349,6 @@ done:
 
 /* --- sandbox subprocess: predicates and snapshots for the reader thread --- */
 
-static bool test_sandbox_out_at_least(void *ctx) {
-    size_t want = (size_t)(uintptr_t)ctx;
-    pthread_mutex_lock(&g_sandbox->mu);
-    bool ok = g_sandbox->out_len >= want;
-    pthread_mutex_unlock(&g_sandbox->mu);
-    return ok;
-}
-
 static bool test_sandbox_saw_stderr(void *ctx) {
     pthread_mutex_lock(&g_sandbox->mu);
     bool ok = g_sandbox->err_len > 0 &&
@@ -368,6 +360,13 @@ static bool test_sandbox_saw_stderr(void *ctx) {
 static bool test_sandbox_is_dead(void *ctx) {
     (void)ctx;
     return g_sandbox && g_sandbox->dead;
+}
+
+/* A sandbox that cannot be talked to any more, whether it died or broke the
+ * protocol. */
+static bool test_sandbox_unusable(void *ctx) {
+    (void)ctx;
+    return g_sandbox && (g_sandbox->dead || g_sandbox->fault[0]);
 }
 
 static bool test_sandbox_wait(bool (*done)(void *), void *ctx, double timeout_sec) {
@@ -407,29 +406,31 @@ static void test_sandbox_lifecycle(void) {
     AGENT_TEST_ASSERT(err[0] && strstr(err, "127"));
     AGENT_TEST_ASSERT(g_sandbox == NULL);
 
-    /* stdin reaches the child and its stdout comes back. */
+    /* Anything the sandbox prints to stdout outside a frame breaks the protocol,
+     * and a plain `cat` is exactly that: what comes back is read as a header and
+     * is not a byte count. */
     SB_START("cat", NULL);
     /* Ignoring SIGPIPE is what turns a write to a dead sandbox into an error the
      * caller can report instead of a signal that kills the agent. */
     AGENT_TEST_ASSERT(signal(SIGPIPE, SIG_IGN) == SIG_IGN);
     write_all(g_sandbox->in_fd, "hello sandbox\n", 14);
-    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_out_at_least,
-                                       (void *)(uintptr_t)14, 5));
-    char *out = test_sandbox_snapshot_out();
-    AGENT_TEST_ASSERT(strstr(out, "hello sandbox"));
-    free(out);
+    char why[512] = {0};
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_unusable, NULL, 5));
+    AGENT_TEST_ASSERT(agent_sandbox_failed(why, sizeof(why)));
+    AGENT_TEST_ASSERT(strstr(why, "byte count"));
     agent_sandbox_stop();
     AGENT_TEST_ASSERT(g_sandbox == NULL);
 
     /* The environment is deliberately small but usable: the mode marker plus
-     * PATH so the command can find things.  The trailing exec keeps the
-     * sandbox alive past the startup grace window. */
-    SB_START("printf 'sb=[%s] path=[%s]\\n' \"$DS4_SANDBOX\" \"${PATH:-unset}\"; exec cat",
+     * PATH so the command can find things.  The probe goes to stderr, because
+     * stdout belongs to the protocol, and the trailing exec keeps the sandbox
+     * alive past the startup grace window. */
+    SB_START("printf 'sb=[%s] path=[%s]\\n' \"$DS4_SANDBOX\" \"${PATH:-unset}\" >&2; exec cat",
              NULL);
-    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_out_at_least, (void *)(uintptr_t)1, 5));
-    out = test_sandbox_snapshot_out();
-    AGENT_TEST_ASSERT(strstr(out, "sb=[1]"));
-    AGENT_TEST_ASSERT(strstr(out, "path=[unset]") == NULL);
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_saw_stderr, (void *)"sb=[1]", 5));
+    AGENT_TEST_ASSERT(!test_sandbox_saw_stderr((void *)"path=[unset]"));
+    char *out = test_sandbox_snapshot_out();
+    AGENT_TEST_ASSERT(!strcmp(out, ""));
     free(out);
     agent_sandbox_stop();
 
@@ -443,7 +444,6 @@ static void test_sandbox_lifecycle(void) {
     free(out);
     kill(g_sandbox->pid, SIGKILL);
     AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_is_dead, NULL, 5));
-    char why[512] = {0};
     AGENT_TEST_ASSERT(agent_sandbox_failed(why, sizeof(why)));
     AGENT_TEST_ASSERT(strstr(why, "signal 9"));
     AGENT_TEST_ASSERT(strstr(why, "boom-on-stderr"));
@@ -511,6 +511,138 @@ static void test_sandbox_lifecycle(void) {
     char *opts[] = {"ds4-agent", "--sandbox", "cat", "--non-interactive"};
     agent_config cfg = parse_options(4, opts);
     AGENT_TEST_ASSERT(cfg.sandbox_cmd && !strcmp(cfg.sandbox_cmd, "cat"));
+}
+
+/* --- framed requests and responses -------------------------------------- */
+
+/* A sandbox that answers every request without understanding it: it reads the
+ * header, then exactly that many payload bytes, and replies with the payload's
+ * byte count.  It also sends a notice frame and a response for an id nobody asked
+ * about, neither of which may complete a request.  /bin/sh on macOS is bash 3.2,
+ * where ${#v} counts characters, so these frames stay ASCII. */
+static const char *SANDBOX_ECHO =
+    "while IFS= read -r n; do "
+    "p=$(dd bs=1 count=\"$n\" 2>/dev/null); "
+    "i=$(printf %s \"$p\" | sed -n 's/^{\"id\":\\([0-9]*\\).*/\\1/p'); "
+    "a=$(printf %s \"$p\" | wc -c | tr -d ' '); "
+    "z=$(printf '{\"id\":0,\"type\":\"log\",\"text\":\"notice-%s\"}' \"$i\"); "
+    "s=$(printf '{\"id\":999,\"ok\":true,\"result\":\"stale\"}'); "
+    "r=$(printf '{\"id\":%s,\"ok\":true,\"result\":\"len-%s\"}' \"$i\" \"$a\"); "
+    "printf '%s\\n%s%s\\n%s%s\\n%s' \"${#z}\" \"$z\" \"${#s}\" \"$s\" \"${#r}\" \"$r\"; "
+    "done";
+
+/* The first answer is one byte over the response ceiling, every later one is
+ * normal: the oversized frame must cost that one request and nothing else. */
+static const char *SANDBOX_BIG =
+    "c=0; while IFS= read -r n; do p=$(dd bs=1 count=\"$n\" 2>/dev/null); "
+    "i=$(printf %s \"$p\" | sed -n 's/^{\"id\":\\([0-9]*\\).*/\\1/p'); c=$((c+1)); "
+    "if [ \"$c\" = 1 ]; then printf '4194305\\n'; yes x | head -c 4194305; "
+    "else r=$(printf '{\"id\":%s,\"ok\":true,\"result\":\"second\"}' \"$i\"); "
+    "printf '%s\\n%s' \"${#r}\" \"$r\"; fi; done";
+
+static void test_sandbox_protocol(void) {
+    char dir[64], trace[96], log[96], err[256], why[512];
+    char *text = NULL;
+    snprintf(dir, sizeof(dir), "/tmp/ds4sbp.%d", (int)getpid());
+    snprintf(trace, sizeof(trace), "%s/model.jsonl", dir);
+    snprintf(log, sizeof(log), "%s.sandbox.log", trace);
+    unlink(log);
+    unlink(trace);
+    rmdir(dir);
+    AGENT_TEST_ASSERT(mkdir(dir, 0755) == 0);
+
+    AGENT_TEST_ASSERT(agent_sandbox_start(SANDBOX_ECHO, trace, err, sizeof(err)));
+    AGENT_TEST_ASSERT(agent_sandbox_request("read", "{\"path\":\"a\"}", NULL, &text));
+    AGENT_TEST_ASSERT(text && !strncmp(text, "len-", 4));
+    long len1 = strtoll(text + 4, NULL, 10);
+    free(text);
+    text = NULL;
+    AGENT_TEST_ASSERT(len1 > 0);
+
+    /* The same call with args that are 13 bytes longer reads 13 bytes more: the
+     * payload arrives whole and nothing of it leaks into the next frame. */
+    AGENT_TEST_ASSERT(agent_sandbox_request("read", "{\"path\":\"a\",\"extra\":\"bb\"}",
+                                            NULL, &text));
+    AGENT_TEST_ASSERT(text && !strncmp(text, "len-", 4));
+    long len2 = strtoll(text + 4, NULL, 10);
+    free(text);
+    text = NULL;
+    AGENT_TEST_ASSERT(len2 == len1 + 13);
+    /* Stopping joins the reader and closes the trace log. */
+    agent_sandbox_stop();
+
+    /* The notices travelled on the same stream as the answers, were written to
+     * the trace sibling and not to the caller, and their ids show that requests
+     * are numbered from one. */
+    FILE *fp = fopen(log, "r");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char buf[512] = {0};
+        size_t got = fread(buf, 1, sizeof(buf) - 1, fp);
+        fclose(fp);
+        AGENT_TEST_ASSERT(got > 0);
+        AGENT_TEST_ASSERT(strstr(buf, "sandbox log: notice-1"));
+        AGENT_TEST_ASSERT(strstr(buf, "sandbox log: notice-2"));
+    }
+    fp = fopen(trace, "r");
+    if (fp) {
+        char buf[512] = {0};
+        size_t got = fread(buf, 1, sizeof(buf) - 1, fp);
+        fclose(fp);
+        /* The model trace stays what it was: no sandbox chatter. */
+        AGENT_TEST_ASSERT(!got || strstr(buf, "notice-") == NULL);
+    }
+
+    AGENT_TEST_ASSERT(agent_sandbox_start(SANDBOX_BIG, NULL, err, sizeof(err)));
+    AGENT_TEST_ASSERT(!agent_sandbox_request("bash", "{\"command\":\"ls\"}",
+                                             NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "too large"));
+    free(text);
+    text = NULL;
+    AGENT_TEST_ASSERT(agent_sandbox_request("bash", "{\"command\":\"ls\"}",
+                                            NULL, &text));
+    AGENT_TEST_ASSERT(text && !strcmp(text, "second"));
+    free(text);
+    text = NULL;
+    AGENT_TEST_ASSERT(!agent_sandbox_failed(why, sizeof(why)));
+    agent_sandbox_stop();
+
+    /* A frame that is not a response object ends the session: there is no way to
+     * find the next frame, and guessing would invent a tool result. */
+    AGENT_TEST_ASSERT(agent_sandbox_start("printf '2\\n{}'; exec cat", NULL,
+                                          err, sizeof(err)));
+    AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_unusable, NULL, 5));
+    AGENT_TEST_ASSERT(agent_sandbox_failed(why, sizeof(why)));
+    AGENT_TEST_ASSERT(strstr(why, "id"));
+    AGENT_TEST_ASSERT(!agent_sandbox_request("read", "{}", NULL, &text));
+    free(text);
+    text = NULL;
+    agent_sandbox_stop();
+
+    /* A request over the ceiling is refused before anything is written, and the
+     * abandoned request leaves the session usable. */
+    AGENT_TEST_ASSERT(agent_sandbox_start(SANDBOX_ECHO, NULL, err, sizeof(err)));
+    size_t want = AGENT_SANDBOX_REQ_MAX + 1024;
+    char *args = xmalloc(want + 1);
+    memcpy(args, "{\"k\":\"", 6);
+    memset(args + 6, 'x', want - 9);
+    memcpy(args + want - 3, "\"}", 3);
+    args[want] = '\0';
+    AGENT_TEST_ASSERT(!agent_sandbox_request("write", args, NULL, &text));
+    free(args);
+    AGENT_TEST_ASSERT(text && strstr(text, "too large"));
+    free(text);
+    text = NULL;
+    AGENT_TEST_ASSERT(agent_sandbox_request("read", "{}", NULL, &text));
+    AGENT_TEST_ASSERT(text && !strncmp(text, "len-", 4));
+    free(text);
+    text = NULL;
+    AGENT_TEST_ASSERT(!agent_sandbox_failed(why, sizeof(why)));
+    agent_sandbox_stop();
+
+    unlink(log);
+    unlink(trace);
+    rmdir(dir);
 }
 
 static void test_completion(const char *text, linenoiseCompletions *completions) {
@@ -1193,6 +1325,7 @@ int main(int argc, char **argv) {
     test_shell_spawn();
     test_background_jobs();
     test_sandbox_lifecycle();
+    test_sandbox_protocol();
     test_fragmented_terminal_input();
     test_shell_terminal_controls();
     test_markdown_literals();

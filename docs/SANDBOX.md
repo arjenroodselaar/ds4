@@ -1,0 +1,153 @@
+# Sandbox Subprocess Protocol
+
+`ds4-agent --sandbox CMD` runs the whole agent behind one long-lived child
+process, spawned as `/bin/sh -c CMD`.  Every tool call the model makes is sent to
+that child and its answer is reported back.  The child is the boundary: when it
+is gone, the session is over, because continuing without it is the one failure
+mode the mode exists to prevent.
+
+This document is the contract for a sandbox implementation.  The agent side
+lives in the "Sandbox Subprocess" section of `ds4_agent.c`.
+
+## Process lifecycle
+
+- The sandbox starts **before** the model is loaded, so a command that cannot
+  run fails in milliseconds with the shell's own message instead of after a
+  minutes-long load.
+- Environment is deliberately small: `DS4_SANDBOX=1`, plus `PATH`, `HOME` and
+  `TMPDIR` copied from the agent.  Everything else is the sandbox's business.
+- The child is its own process group leader, so teardown reaches grandchildren.
+- Teardown closes stdin, then escalates SIGTERM to SIGKILL for the group.  It
+  runs on every exit path, including the paths that leave through `exit()`.
+- A sandbox that dies or is killed ends the session: the interactive REPL takes
+  exactly the `/exit` path (including the offer to save the transcript) and the
+  non-interactive mode prints the reason to stderr and exits 1.  Both notice at
+  a turn boundary, so a reply already being generated is finished and printed
+  first.
+- If a write fails with `EPIPE`, the agent reports it.  The agent ignores
+  `SIGPIPE` from the moment the child exists.
+
+## Channels
+
+| Child channel | Meaning |
+|---|---|
+| stdin | requests from the agent |
+| stdout | frames only, in the format below — nothing else may ever be printed here |
+| stderr | the child's own diagnostics; never a result |
+
+The sandbox folds the stderr of the work it performs into the `result` text it
+reports, so nothing out of band can reach the conversation.  Agent stderr is
+drained continuously, kept as a short tail, mirrored to `<trace_path>.sandbox.log`
+when `--trace` is set, and included in the failure reason when the sandbox dies.
+
+## Framing
+
+Both directions use the same frame:
+
+```
+<decimal byte count>\n<exactly that many bytes of JSON>
+```
+
+- The header is 1-20 ASCII digits followed by a newline, and at most 32 bytes.
+- The payload is exactly one JSON object.  It may contain raw newlines; nothing
+  is escaped because the length is counted, not delimited.
+- Ceilings: **1 MiB** per request, **4 MiB** per response.
+- Requests are strictly sequential: exactly one is in flight at a time, and the
+  answer must carry the same `id`.
+
+## Request (agent to sandbox)
+
+```json
+{"id":7,"tool":"read","args":{"path":"ds4_agent.c","start_line":"120"}}
+```
+
+- `id` — integer starting at 1, increasing.  `0` is reserved for sandbox
+  notices and never appears in a request.
+- `tool` — one of the routed names below.
+- `args` — a flat object in which **every value is a JSON string**, numbers and
+  booleans included (`"timeout_sec":"30"`, `"whole":"true"`).  This mirrors the
+  flat string arguments the tools parse today, so a sandbox can pass them
+  through unchanged.  Omitted arguments are simply absent; `"args":{}` is valid.
+
+Routed tools: `read`, `more`, `write`, `list`, `edit`, `search`, `bash`,
+`bash_status`, `bash_stop`.  `bash` honours `timeout_sec` inside the sandbox.
+
+`google_search`, `visit_page` and `view_image` are never sent: the agent answers
+them itself with a fixed "not available in sandbox mode" error, because they need
+the network, a browser or the vision model that lives in the agent process.
+
+A request that would exceed 1 MiB is not written at all; the agent reports the
+failed call itself.  This can happen with a large `write` or `edit` body and is
+not a sandbox fault.
+
+## Response (sandbox to agent)
+
+```json
+{"id":7,"ok":true,"result":"   120  static int main(int argc, char **argv) {\n"}
+{"id":7,"ok":false,"error":"read: no such file or directory"}
+```
+
+- `ok` is a JSON boolean and is mandatory, and so is the matching text member:
+  `result` when true, `error` when false.  Both are strings, already formatted
+  for the model, tool stderr included.
+- The agent wraps the text as `Tool result N (name):` and truncates it to
+  128 KiB on a UTF-8 boundary, so an answer only has to be complete enough to be
+  useful.
+- A response whose `id` matches nothing currently pending is discarded silently,
+  which is what makes an interrupted request safe to abandon: the user can
+  interrupt a wait, and the late answer that follows is dropped instead of being
+  applied to a later call.
+
+## Sandbox notices
+
+```json
+{"id":0,"type":"log","text":"watching 3 paths"}
+```
+
+A notice is a frame with `id` 0.  It never completes a request and never reaches
+the model.  The agent appends it to the trace output (`agent_trace()`), which
+means it is dropped entirely without `--trace`, and it does not count as activity
+for any timeout.  Extra members are allowed.
+
+## Failures
+
+Fatal, and the session is torn down:
+
+- a header that is not a byte count, is empty, or is longer than 32 bytes;
+- EOF or a short read in the middle of a payload;
+- a payload that is not one JSON object, or a response frame missing `id` or a
+  boolean `ok`.
+
+Recoverable, and only the affected call fails:
+
+- a response over 4 MiB: the frame is discarded, byte-counted out of the stream
+  without buffering it, and the waiting request is answered with an error;
+- a request over 1 MiB: never written;
+- a response for an unknown or abandoned `id`: dropped.
+
+## Minimal sandbox
+
+The smallest useful shape, in shell, is a loop that reads a count, reads that
+many bytes, and answers.  In practice a sandbox is written in a language with a
+JSON library and `subprocess`:
+
+```python
+import json, sys
+
+def frame(obj):
+    body = json.dumps(obj)
+    sys.stdout.write(f"{len(body)}\n{body}")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    body = sys.stdin.read(int(line))
+    req = json.loads(body)
+    try:
+        result = run(req["tool"], req["args"])       # returns str, stderr folded in
+        frame({"id": req["id"], "ok": True, "result": result})
+    except Exception as exc:                          # noqa: BLE001
+        frame({"id": req["id"], "ok": False, "error": str(exc)})
+```
+
+Remember that anything printed to stdout outside `frame()` corrupts the stream
+and ends the session; diagnostics belong on stderr.
