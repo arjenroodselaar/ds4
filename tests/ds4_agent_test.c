@@ -645,6 +645,76 @@ static void test_sandbox_protocol(void) {
     rmdir(dir);
 }
 
+/* The reference helper in ../ds4-sandbox-helper is a different language and a
+ * different runtime answering the same frames.  Only agreeing on the bytes makes
+ * that worth having, so when the binary is around, drive it with the agent's own
+ * client and check that real tools answer through real framing:
+ * DS4_SANDBOX_HELPER=../ds4-sandbox-helper/target/release/ds4-sandbox-helper.
+ * It is opt-in because building it needs cargo, which the C build does not assume. */
+static void test_sandbox_helper(void) {
+    const char *cmd = getenv("DS4_SANDBOX_HELPER");
+    if (!cmd || !*cmd) {
+        puts("ds4-agent tests: DS4_SANDBOX_HELPER unset, helper interop skipped");
+        return;
+    }
+
+    char dir[64], path[128], args[512], err[256], why[512];
+    char *text = NULL;
+    snprintf(dir, sizeof(dir), "/tmp/ds4sbh.%d", (int)getpid());
+    snprintf(path, sizeof(path), "%s/main.c", dir);
+    unlink(path);
+    rmdir(dir);
+    AGENT_TEST_ASSERT(mkdir(dir, 0755) == 0);
+
+    AGENT_TEST_ASSERT(agent_sandbox_start(cmd, NULL, err, sizeof(err)));
+
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"content\":\"int main(void) { return 0; }\\n\"}", path);
+    AGENT_TEST_ASSERT(agent_sandbox_request("write", args, NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "Wrote 29 bytes"));
+    free(text);
+    text = NULL;
+
+    snprintf(args, sizeof(args), "{\"path\":\"%s\"}", path);
+    AGENT_TEST_ASSERT(agent_sandbox_request("read", args, NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "1 int main(void) { return 0; }"));
+    free(text);
+    text = NULL;
+
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"old\":\"return 0;\",\"new\":\"return 3;\"}", path);
+    AGENT_TEST_ASSERT(agent_sandbox_request("edit", args, NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "Touched old lines 1-1"));
+    free(text);
+    text = NULL;
+
+    snprintf(args, sizeof(args), "{\"path\":\"%s\"}", dir);
+    AGENT_TEST_ASSERT(agent_sandbox_request("list", args, NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "main.c"));
+    free(text);
+    text = NULL;
+
+    snprintf(args, sizeof(args), "{\"query\":\"return 3\",\"path\":\"%s\"}", dir);
+    AGENT_TEST_ASSERT(agent_sandbox_request("search", args, NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "return 3;"));
+    free(text);
+    text = NULL;
+
+    AGENT_TEST_ASSERT(agent_sandbox_request("bash",
+                                            "{\"command\":\"printf 'a\\\\nb\\\\n'\"}",
+                                            NULL, &text));
+    AGENT_TEST_ASSERT(text && strstr(text, "exit_status=0") && strstr(text, "<output>"));
+    AGENT_TEST_ASSERT(text && strstr(text, "a\nb"));
+    free(text);
+    text = NULL;
+
+    AGENT_TEST_ASSERT(!agent_sandbox_failed(why, sizeof(why)));
+    agent_sandbox_stop();
+
+    unlink(path);
+    rmdir(dir);
+}
+
 /* --- routing tool calls to the sandbox ---------------------------------- */
 
 /* Answers a request with its own payload, so a test can read back the exact
@@ -1488,6 +1558,7 @@ int main(int argc, char **argv) {
     test_background_jobs();
     test_sandbox_lifecycle();
     test_sandbox_protocol();
+    test_sandbox_helper();
     test_sandbox_routing();
     test_fragmented_terminal_input();
     test_shell_terminal_controls();
