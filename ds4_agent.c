@@ -9641,6 +9641,16 @@ static bool agent_sandbox_failed(char *why, size_t whylen) {
     return true;
 }
 
+/* Called wherever a run can end: reports why the sandbox is gone, if it is, and
+ * turns that into a failed exit code. */
+static bool agent_sandbox_report_loss(int *rc) {
+    char why[512];
+    if (!agent_sandbox_failed(why, sizeof(why))) return false;
+    fprintf(stderr, "ds4-agent: sandbox exited: %s\n", why);
+    *rc = 1;
+    return true;
+}
+
 /* The sandbox command needs enough environment to find and run things; anything
  * beyond that is the sandbox's own business to sanitize. */
 static size_t agent_sandbox_env_add(char *env[], size_t envc, char *slot,
@@ -9774,6 +9784,11 @@ static bool agent_sandbox_start(const char *cmd, const char *trace_path,
     }
     sb->reader_started = true;
     g_sandbox = sb;
+
+    /* From here on the agent holds a pipe whose reader can vanish: without
+     * this, a sandbox that dies between turns would turn the next write into
+     * SIGPIPE, killing the agent instead of returning EPIPE. */
+    signal(SIGPIPE, SIG_IGN);
 
     double deadline = now_sec() + AGENT_SANDBOX_SPAWN_GRACE_SEC;
     while (!agent_sandbox_dead(sb) && now_sec() < deadline) usleep(10000);
@@ -13369,6 +13384,15 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         bool initialized = worker_is_initialized(&worker, NULL);
         bool idle = worker_is_idle(&worker);
 
+        /* Losing the sandbox ends the run, but it is noticed at a turn
+         * boundary: the reply already streaming is the caller's answer, so a
+         * turn in flight is finished and printed before the teardown.  Idle is
+         * also what makes the loss actionable - with nothing in flight there is
+         * no answer left to lose, and waiting in poll() below would wait for
+         * work that can never be submitted again.  There is no prompt to ask
+         * "save the session?" in this mode, so atexit() closes the sandbox. */
+        if (cfg->sandbox_cmd && idle && agent_sandbox_report_loss(&rc)) break;
+
         if (one_shot && !one_shot_submitted && initialized) {
             if (worker_submit(&worker, cfg->gen.prompt))
                 one_shot_submitted = true;
@@ -13451,17 +13475,6 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             break;
         }
 
-        /* There is no prompt to ask "save the session?" in this mode, so a lost
-         * sandbox is reported and the process leaves; atexit() closes it. */
-        if (cfg->sandbox_cmd) {
-            char why[512];
-            if (agent_sandbox_failed(why, sizeof(why))) {
-                fprintf(stderr, "ds4-agent: sandbox exited: %s\n", why);
-                rc = 1;
-                break;
-            }
-        }
-
         if (!one_shot && input.len > 0 &&
             (stdin_eof || now_sec() >= quiet_deadline))
         {
@@ -13478,6 +13491,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             free(prompt);
             waiting_announced = false;
         }
+
+        /* And the other half of the turn boundary: the sandbox died while a turn
+         * was in flight, so the answer just finished and this run is over. */
+        if (cfg->sandbox_cmd && worker_is_idle(&worker) &&
+            agent_sandbox_report_loss(&rc))
+            break;
 
         if (one_shot && one_shot_submitted && worker_is_idle(&worker)) break;
         if (!one_shot && stdin_eof && input.len == 0 &&
@@ -13552,9 +13571,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     while (running) {
         /* The sandbox is the boundary everything else runs behind, so losing it
          * ends the session the same way /exit does: stop the editor first, then
-         * give the user the chance to keep the transcript.  Reported once; a
-         * user who cancels after a failed save keeps the prompt they chose. */
-        if (cfg->sandbox_cmd && !sandbox_exit_handled) {
+         * give the user the chance to keep the transcript.  Reported once, and
+         * only once the model is idle: a reply in progress still gets finished
+         * and stays readable before the teardown.  A user who cancels after a
+         * failed save keeps the prompt they chose. */
+        if (cfg->sandbox_cmd && !sandbox_exit_handled && worker_is_idle(&worker)) {
             char why[512];
             if (agent_sandbox_failed(why, sizeof(why))) {
                 sandbox_exit_handled = true;

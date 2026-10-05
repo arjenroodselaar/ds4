@@ -409,6 +409,9 @@ static void test_sandbox_lifecycle(void) {
 
     /* stdin reaches the child and its stdout comes back. */
     SB_START("cat", NULL);
+    /* Ignoring SIGPIPE is what turns a write to a dead sandbox into an error the
+     * caller can report instead of a signal that kills the agent. */
+    AGENT_TEST_ASSERT(signal(SIGPIPE, SIG_IGN) == SIG_IGN);
     write_all(g_sandbox->in_fd, "hello sandbox\n", 14);
     AGENT_TEST_ASSERT(test_sandbox_wait(test_sandbox_out_at_least,
                                        (void *)(uintptr_t)14, 5));
@@ -444,6 +447,10 @@ static void test_sandbox_lifecycle(void) {
     AGENT_TEST_ASSERT(agent_sandbox_failed(why, sizeof(why)));
     AGENT_TEST_ASSERT(strstr(why, "signal 9"));
     AGENT_TEST_ASSERT(strstr(why, "boom-on-stderr"));
+    /* The agent must survive a write to the dead sandbox and get an errno it can
+     * report, rather than dying on SIGPIPE with the reason unreached. */
+    errno = 0;
+    AGENT_TEST_ASSERT(write(g_sandbox->in_fd, "x", 1) < 0 && errno == EPIPE);
     agent_sandbox_stop();
     AGENT_TEST_ASSERT(g_sandbox == NULL);
 
