@@ -9944,6 +9944,15 @@ static bool agent_sandbox_request(const char *tool, const char *args_json,
     buf body = {0};
     buf_printf(&body, "{\"id\":%lld,\"tool\":", id);
     json_escape(&body, tool);
+    /* The size a bare read or more should return follows the model's context, and
+     * only this process knows that.  It travels in its own object rather than
+     * inside args because it is not model input: it is a cap the sender states, in
+     * JSON types the sandbox can trust without parsing a string.  Sending it per
+     * request rather than agreeing on one number at startup also means a helper
+     * shared between sessions of different sizes answers each with the right one,
+     * and a future cap can be named in the same object without inventing another
+     * top-level member. */
+    buf_printf(&body, ",\"limits\":{\"read_lines\":%d}", agent_read_default_lines(w));
     buf_puts(&body, ",\"args\":");
     buf_puts(&body, args_json && args_json[0] ? args_json : "{}");
     buf_putc(&body, '}');

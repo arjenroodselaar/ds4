@@ -798,14 +798,19 @@ static void test_sandbox_routing(void) {
     agent_tool_call_add_arg(&read, "path", "/x", 2, false, NULL);
     agent_tool_call_add_arg(&read, "max_lines", "40", 2, false, NULL);
     char *res = agent_execute_tool_call(&w, &read);
+    /* The exact frame the sandbox is promised: an id, the tool's name, the size a
+     * bare read should return for this model, and args whose every value is a
+     * string.  A worker with no context size to work from gets the largest default
+     * rather than the smallest. */
     AGENT_TEST_ASSERT(res && !strcmp(res,
-        "{\"id\":1,\"tool\":\"read\",\"args\":{\"path\":\"/x\","
-        "\"max_lines\":\"40\"}}"));
+        "{\"id\":1,\"tool\":\"read\",\"limits\":{\"read_lines\":500},"
+        "\"args\":{\"path\":\"/x\",\"max_lines\":\"40\"}}"));
     free(res);
 
     res = agent_execute_tool_call(&w, &read);
     AGENT_TEST_ASSERT(res && !strncmp(res, "{\"id\":2,", 8));
     free(res);
+
     agent_tool_call_free(&read);
 
     /* The tools the sandbox cannot serve are answered where they are refused, and
@@ -857,6 +862,25 @@ static void test_sandbox_routing(void) {
     AGENT_TEST_ASSERT(res && !strcmp(res, "Tool error: read-only path"));
     free(res);
     agent_tool_call_free(&wr);
+
+    /* A small model gets a small read.  The sandbox cannot see how full this
+     * session's context is, so the size a bare read should return travels with the
+     * request instead of being guessed at the other end.  It comes last because it
+     * costs an id of its own. */
+    agent_config tiny = {0};
+    tiny.gen.ctx_size = 8192;
+    agent_worker small = {0};
+    pthread_mutex_init(&small.mu, NULL);
+    small.wake_fd[0] = small.wake_fd[1] = -1;
+    small.cfg = &tiny;
+    agent_tool_call small_read = {0};
+    small_read.name = xstrdup("read");
+    agent_tool_call_add_arg(&small_read, "path", "/x", 2, false, NULL);
+    res = agent_execute_tool_call(&small, &small_read);
+    AGENT_TEST_ASSERT(res && strstr(res, "\"limits\":{\"read_lines\":120}"));
+    free(res);
+    agent_tool_call_free(&small_read);
+
     agent_sandbox_stop();
 
     /* An answer over the tool byte limit is cut down here: a sandbox that

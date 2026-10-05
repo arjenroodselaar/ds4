@@ -62,7 +62,7 @@ Both directions use the same frame:
 ## Request (agent to sandbox)
 
 ```json
-{"id":7,"tool":"read","args":{"path":"ds4_agent.c","start_line":"120"}}
+{"id":7,"tool":"read","limits":{"read_lines":240},"args":{"path":"ds4_agent.c","start_line":"120"}}
 ```
 
 - `id` — integer starting at 1, increasing.  `0` is reserved for sandbox
@@ -72,6 +72,21 @@ Both directions use the same frame:
   booleans included (`"timeout_sec":"30"`, `"whole":"true"`).  This mirrors the
   flat string arguments the tools parse today, so a sandbox can pass them
   through unchanged.  Omitted arguments are simply absent; `"args":{}` is valid.
+- `limits` — an object of things the sender knows about the model behind the
+  request that the sandbox cannot work out for itself.  Its values are JSON
+  numbers, unlike `args`.  A sandbox ignores a `limits` member it does not
+  recognise, and a `limits` object that is absent or malformed, rather than
+  rejecting the request: that is what lets a newer agent name another cap to an
+  older sandbox.  Any future cap belongs here rather than beside `id`, so the
+  request object itself does not grow a new top-level member every time.
+- `limits.read_lines` — how many lines a `read` or `more` that names no size should
+  return.  The agent chooses it from the model's context window (120 lines up to
+  8192 tokens, 240 up to 16384, 500 above), and sends it every request because the
+  sandbox cannot see the model it is answering for.  A sandbox should clamp the
+  number it is given (at least 1, at most 500), fall back to its own setting when it
+  is absent, and let an explicit `max_lines` or `count` argument win over both.  The
+  cap is there so a hand-written frame cannot ask for the whole file; the 128 KiB
+  answer limit still applies either way.
 
 Routed tools: `read`, `more`, `write`, `list`, `edit`, `search`, `bash`,
 `bash_status`, `bash_stop`.  `bash` honours `timeout_sec` inside the sandbox.
@@ -137,6 +152,24 @@ Recoverable, and only the affected call fails:
   without buffering it, and the waiting request is answered with an error;
 - a request over 1 MiB: never written;
 - a response for an unknown or abandoned `id`: dropped.
+
+## Open: nothing bounds the wait
+
+The agent waits for a response without a deadline, which is the one way this
+protocol can stop a run with both processes still alive.  A sandbox that is
+healthy but slow is only delayed; a sandbox that is wedged — blocked in a read of
+its own, waiting on a lock inside the container, or a process that the container
+runtime started but never managed to launch — holds the session open
+indefinitely.  An interactive user can interrupt that wait.  A non-interactive
+run cannot: the model has already been answered, the tool has not run, and the
+process sits there until it is killed from outside.
+
+A fix has an obvious shape: a per-request deadline that fails **the call** rather
+than the session, since the sandbox may be perfectly healthy and merely slow, and
+the abandoned-request rule already makes its late answer harmless.  Nothing like
+it is implemented yet, so a sandbox that wants to be robust on its own has to
+bound the work it does per request (`bash` has `timeout_sec` for exactly this
+reason) rather than rely on the agent to time it out.
 
 ## Minimal sandbox
 
