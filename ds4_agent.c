@@ -405,6 +405,10 @@ static int agent_web_confirm(void *privdata, const char *message,
 static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
+/* True while --sandbox owns the tools.  Declared here because the streaming
+ * preflight below has to know that the files it would open are not the ones the
+ * tool call is about. */
+static bool agent_sandbox_active(void);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
@@ -4182,7 +4186,11 @@ static void agent_stream_tool_events(agent_stream_renderer *sr) {
 }
 
 static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
-    if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
+    /* In sandbox mode the selector can only be checked where the file is, and a
+     * same-named file in this process would either agree for the wrong reason or
+     * reject a call that the sandbox would have accepted. */
+    if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error ||
+        agent_sandbox_active())
         return;
     agent_dsml_parser *p = sr->parser;
     agent_tool_visualizer *v = &sr->viz;
@@ -9895,25 +9903,14 @@ static bool agent_sandbox_write_frame(agent_sandbox *sb, const char *json,
     return true;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-#define DS4_AGENT_MAYBE_UNUSED __attribute__((unused))
-#else
-#define DS4_AGENT_MAYBE_UNUSED
-#endif
-
 /* Runs one request in the sandbox and returns the text to report for it, true
  * when the sandbox reported success.  Exactly one request is in flight: args_json
  * is the already-encoded {"k":"v",...} object, and the answer must carry the id
  * this call chose.  The wait is interruptible through the worker, and an
  * interrupted request abandons its id, so the answer that arrives later is
- * dropped instead of being reported for whatever is asked next.
- *
- * Marked unused because the caller is the tool routing that follows: nothing in
- * the agent can ask a sandbox for a tool result until that exists. */
-static DS4_AGENT_MAYBE_UNUSED bool agent_sandbox_request(const char *tool,
-                                                         const char *args_json,
-                                                         agent_worker *w,
-                                                         char **text) {
+ * dropped instead of being reported for whatever is asked next. */
+static bool agent_sandbox_request(const char *tool, const char *args_json,
+                                  agent_worker *w, char **text) {
     agent_sandbox *sb = g_sandbox;
     if (!sb) {
         *text = xstrdup("no sandbox is running");
@@ -10005,6 +10002,90 @@ static DS4_AGENT_MAYBE_UNUSED bool agent_sandbox_request(const char *tool,
         }
         usleep(AGENT_SANDBOX_WAIT_MS * 1000);
     }
+}
+
+/* The tools the sandbox is asked to run.  A name outside this list is unknown to
+ * both sides and is reported without spending a request on it. */
+static bool agent_sandbox_tool_is_routed(const char *name) {
+    static const char *const routed[] = {"read", "more", "write", "list", "edit",
+                                         "search", "bash", "bash_status",
+                                         "bash_stop"};
+    if (!name) return false;
+    for (size_t i = 0; i < sizeof(routed) / sizeof(routed[0]); i++)
+        if (!strcmp(routed[i], name)) return true;
+    return false;
+}
+
+/* The network and image tools are refused here rather than forwarded: the sandbox
+ * has no network and no vision encoder, and running them in the process that is
+ * supposed to be kept away from the work is the one thing the mode exists to
+ * prevent. */
+static bool agent_sandbox_tool_is_blocked(const char *name) {
+    static const char *const blocked[] = {"google_search", "visit_page",
+                                          "view_image"};
+    if (!name) return false;
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++)
+        if (!strcmp(blocked[i], name)) return true;
+    return false;
+}
+
+static void agent_sandbox_blocked_msg(const char *name, char *dst, size_t cap) {
+    snprintf(dst, cap, "Tool error: %s is not available in sandbox mode\n",
+             name ? name : "unknown tool");
+}
+
+/* The wire form of a parsed call.  Every value goes out as a JSON string, because
+ * a parsed call holds every parameter as text and there is nothing to un-quote:
+ * "timeout_sec":"30" is the correct request, and interpreting it is the sandbox's
+ * job.  A repeated parameter keeps its first value, which is the one
+ * agent_tool_arg_value() would have handed to a local tool. */
+static char *agent_sandbox_args_json(const agent_tool_call *call) {
+    buf body = {0};
+    buf_putc(&body, '{');
+    bool first = true;
+    for (int i = 0; i < call->argc; i++) {
+        const char *name = call->args[i].name;
+        if (!name) continue;
+        bool seen = false;
+        for (int j = 0; j < i; j++) {
+            if (call->args[j].name && !strcmp(call->args[j].name, name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (!first) buf_putc(&body, ',');
+        first = false;
+        json_escape(&body, name);
+        buf_putc(&body, ':');
+        json_escape(&body, call->args[i].value ? call->args[i].value : "");
+    }
+    buf_putc(&body, '}');
+    return buf_take(&body);
+}
+
+/* Runs one tool call in the sandbox and returns the text that the caller wraps in
+ * the observation.  A failure is reported the way a local failure is, as text
+ * starting with "Tool error: ", and the result obeys the tool byte limit, so an
+ * over-serving sandbox cannot put a bigger transcript in front of the model than
+ * the agent would have allowed itself. */
+static char *agent_sandbox_tool_call(agent_worker *w, const agent_tool_call *call) {
+    char *args = agent_sandbox_args_json(call);
+    char *text = NULL;
+    bool ok = agent_sandbox_request(call->name, args, w, &text);
+    free(args);
+
+    agent_buf result = {.limit = AGENT_TOOL_MAX_BYTES};
+    if (!ok) agent_buf_puts(&result, "Tool error: ");
+    agent_buf_puts(&result, text ? text : "");
+    free(text);
+    return agent_buf_take(&result);
+}
+
+/* True while a sandbox owns the tools: this process must not touch the files and
+ * processes the model names, not even to preflight a call. */
+static bool agent_sandbox_active(void) {
+    return g_sandbox != NULL;
 }
 
 /* The sandbox command needs enough environment to find and run things; anything
@@ -10286,6 +10367,13 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
 
+    /* In sandbox mode these tools run there and nowhere else.  A name that is
+     * neither routed nor one of the blocked tools falls through to the report at
+     * the bottom: it is unknown to the sandbox too, and asking would only invite
+     * the sandbox to invent an answer. */
+    if (agent_sandbox_active() && agent_sandbox_tool_is_routed(call->name))
+        return agent_sandbox_tool_call(w, call);
+
     if (!strcmp(call->name, "read")) return agent_tool_read(w, call);
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
@@ -10352,6 +10440,14 @@ static agent_tool_observation agent_execute_tool_observation(
         snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
                  calls->v[i].name ? calls->v[i].name : "unknown");
         agent_tool_observation_puts(&obs, hdr);
+        /* Checked here rather than in the dispatch below because view_image never
+         * reaches it: an image is an observation, not a text result. */
+        if (agent_sandbox_active() && agent_sandbox_tool_is_blocked(calls->v[i].name)) {
+            char msg[160];
+            agent_sandbox_blocked_msg(calls->v[i].name, msg, sizeof(msg));
+            agent_tool_observation_puts(&obs, msg);
+            continue;
+        }
         if (calls->v[i].name && !strcmp(calls->v[i].name, "view_image")) {
             agent_tool_view_image(w, &calls->v[i], &obs);
             continue;

@@ -52,6 +52,10 @@ Both directions use the same frame:
 - The payload is exactly one JSON object.  It may contain raw newlines; nothing
   is escaped because the length is counted, not delimited.
 - Ceilings: **1 MiB** per request, **4 MiB** per response.
+- The count is **bytes**, not characters.  Write the payload as bytes and count
+  the encoded form: a result containing one non-ASCII character is longer in bytes
+  than in characters, and a header that counts characters desynchronises the
+  stream and ends the session.
 - Requests are strictly sequential: exactly one is in flight at a time, and the
   answer must carry the same `id`.
 
@@ -74,7 +78,16 @@ Routed tools: `read`, `more`, `write`, `list`, `edit`, `search`, `bash`,
 
 `google_search`, `visit_page` and `view_image` are never sent: the agent answers
 them itself with a fixed "not available in sandbox mode" error, because they need
-the network, a browser or the vision model that lives in the agent process.
+the network, a browser or the vision model that lives in the agent process.  A
+name that is neither routed nor one of those three is reported locally as an
+unknown tool, also without a request: the sandbox is not asked to guess what a
+tool it never advertised should do.
+
+The agent also stops preflighting `edit` calls against its own filesystem while
+sandboxed.  Normally an `old` selector that cannot match is rejected while the call
+is still being generated; in sandbox mode only the sandbox knows what its file
+contains, so the check belongs to the `edit` tool there and the answer arrives as
+an ordinary failed call.
 
 A request that would exceed 1 MiB is not written at all; the agent reports the
 failed call itself.  This can happen with a large `write` or `edit` body and is
@@ -132,22 +145,45 @@ many bytes, and answers.  In practice a sandbox is written in a language with a
 JSON library and `subprocess`:
 
 ```python
-import json, sys
+import json, subprocess, sys
+
+inp, out = sys.stdin.buffer, sys.stdout.buffer
 
 def frame(obj):
-    body = json.dumps(obj)
-    sys.stdout.write(f"{len(body)}\n{body}")
-    sys.stdout.flush()
+    body = json.dumps(obj).encode("utf-8")           # count bytes, not characters
+    out.write(str(len(body)).encode("ascii") + b"\n" + body)
+    out.flush()
 
-for line in sys.stdin:
-    body = sys.stdin.read(int(line))
-    req = json.loads(body)
+def run(tool, args):                                 # every arg value is a str
+    if tool == "bash":
+        p = subprocess.run(args["command"], shell=True, capture_output=True,
+                           stdin=subprocess.DEVNULL,
+                           timeout=int(args.get("timeout_sec", "3600")))
+        return p.returncode == 0, (p.stdout + p.stderr).decode("utf-8", "replace")
+    return False, "not implemented by this sandbox: " + tool
+
+while True:
+    header = inp.readline()
+    if not header:
+        break
+    req = json.loads(inp.read(int(header)))
     try:
-        result = run(req["tool"], req["args"])       # returns str, stderr folded in
-        frame({"id": req["id"], "ok": True, "result": result})
-    except Exception as exc:                          # noqa: BLE001
-        frame({"id": req["id"], "ok": False, "error": str(exc)})
+        ok, text = run(req["tool"], req.get("args", {}))
+    except Exception as exc:                         # noqa: BLE001
+        ok, text = False, str(exc)                   # a failed tool is a result,
+    frame({"id": req["id"], "ok": ok,                # not a broken session
+           "result" if ok else "error": text})
 ```
 
-Remember that anything printed to stdout outside `frame()` corrupts the stream
-and ends the session; diagnostics belong on stderr.
+Three traps in that loop are worth naming, because each one is a silent hang or a
+dead session rather than a message:
+
+- Anything printed to stdout outside `frame()` corrupts the stream and ends the
+  session; diagnostics belong on stderr.
+- Read the header and the payload from the **same** stream.  A text-mode
+  `sys.stdin.readline()` followed by a byte-mode `sys.stdin.buffer.read(n)` loses
+  the bytes the text layer already buffered: the sandbox then waits forever for a
+  payload that arrived long ago.
+- Never let a tool subprocess inherit the sandbox's stdin.  A command that reads
+  stdin consumes the agent's *requests* off the protocol, and the session is
+  unrecoverable.  Hand it `subprocess.DEVNULL`, or its own input.

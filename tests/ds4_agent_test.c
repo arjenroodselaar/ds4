@@ -645,6 +645,168 @@ static void test_sandbox_protocol(void) {
     rmdir(dir);
 }
 
+/* --- routing tool calls to the sandbox ---------------------------------- */
+
+/* Answers a request with its own payload, so a test can read back the exact
+ * frame the agent sent, and refuses "write" with ok:false so the shape of a
+ * sandbox-reported failure can be checked too. */
+static const char *SANDBOX_REPLAY =
+    "while IFS= read -r n; do "
+    "p=$(dd bs=1 count=\"$n\" 2>/dev/null); "
+    "i=$(printf %s \"$p\" | sed -n 's/^{\"id\":\\([0-9]*\\).*/\\1/p'); "
+    "e=$(printf %s \"$p\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g'); "
+    "case \"$p\" in *'\"tool\":\"write\"'*) "
+    "r=$(printf '{\"id\":%s,\"ok\":false,\"error\":\"read-only path\"}' \"$i\");; "
+    "*) r=$(printf '{\"id\":%s,\"ok\":true,\"result\":\"%s\"}' \"$i\" \"$e\");; "
+    "esac; printf '%s\\n%s' \"${#r}\" \"$r\"; done";
+
+/* Answers every request with 200 KiB of text: legal under the response ceiling
+ * and over the agent's own tool byte limit. */
+static const char *SANDBOX_VOLUBILE =
+    "while IFS= read -r n; do "
+    "p=$(dd bs=1 count=\"$n\" 2>/dev/null); "
+    "i=$(printf %s \"$p\" | sed -n 's/^{\"id\":\\([0-9]*\\).*/\\1/p'); "
+    "y=$(awk 'BEGIN{s=\"\";for(i=0;i<200000;i++)s=s \"y\";print s}'); "
+    "r=$(printf '{\"id\":%s,\"ok\":true,\"result\":\"%s\"}' \"$i\" \"$y\"); "
+    "printf '%s\\n%s' \"${#r}\" \"$r\"; done";
+
+static char *test_observation_text(agent_tool_observation *obs) {
+    size_t total = 1;
+    for (size_t i = 0; i < obs->part_count; i++) total += obs->parts[i].len;
+    char *joined = xmalloc(total);
+    size_t off = 0;
+    for (size_t i = 0; i < obs->part_count; i++) {
+        if (obs->parts[i].text) {
+            memcpy(joined + off, obs->parts[i].text, obs->parts[i].len);
+            off += obs->parts[i].len;
+        }
+    }
+    joined[off] = '\0';
+    return joined;
+}
+
+static void test_sandbox_routing(void) {
+    /* The args object is what the sandbox is promised: every value a string,
+     * because a parsed call keeps every parameter as text. */
+    agent_tool_call call = {0};
+    call.name = xstrdup("bash");
+    const char *cmd = "printf 'hi\n' > /tmp/x";
+    agent_tool_call_add_arg(&call, "command", cmd, strlen(cmd), false, NULL);
+    agent_tool_call_add_arg(&call, "timeout_sec", "30", 2, false, NULL);
+    agent_tool_call_add_arg(&call, "path", "a\"b", 3, false, NULL);
+    agent_tool_call_add_arg(&call, "path", "ignored", 7, false, NULL);
+    char *args_json = agent_sandbox_args_json(&call);
+    AGENT_TEST_ASSERT(!strcmp(args_json,
+        "{\"command\":\"printf 'hi\\n' > /tmp/x\",\"timeout_sec\":\"30\","
+        "\"path\":\"a\\\"b\"}"));
+    free(args_json);
+    agent_tool_call_free(&call);
+
+    /* A call with no parameters is still an object, not an absent field. */
+    agent_tool_call bare = {0};
+    bare.name = xstrdup("list");
+    args_json = agent_sandbox_args_json(&bare);
+    AGENT_TEST_ASSERT(!strcmp(args_json, "{}"));
+    free(args_json);
+
+    AGENT_TEST_ASSERT(agent_sandbox_tool_is_routed("bash_status"));
+    AGENT_TEST_ASSERT(agent_sandbox_tool_is_routed("search"));
+    AGENT_TEST_ASSERT(!agent_sandbox_tool_is_routed("google_search"));
+    AGENT_TEST_ASSERT(!agent_sandbox_tool_is_routed("view_image"));
+    AGENT_TEST_ASSERT(!agent_sandbox_tool_is_routed("frobnicate"));
+    AGENT_TEST_ASSERT(agent_sandbox_tool_is_blocked("visit_page"));
+    AGENT_TEST_ASSERT(!agent_sandbox_tool_is_blocked("list"));
+
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(agent_sandbox_start(SANDBOX_REPLAY, NULL, err, sizeof(err)));
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[0] = w.wake_fd[1] = -1;
+
+    agent_tool_call read = {0};
+    read.name = xstrdup("read");
+    agent_tool_call_add_arg(&read, "path", "/x", 2, false, NULL);
+    agent_tool_call_add_arg(&read, "max_lines", "40", 2, false, NULL);
+    char *res = agent_execute_tool_call(&w, &read);
+    AGENT_TEST_ASSERT(res && !strcmp(res,
+        "{\"id\":1,\"tool\":\"read\",\"args\":{\"path\":\"/x\","
+        "\"max_lines\":\"40\"}}"));
+    free(res);
+
+    res = agent_execute_tool_call(&w, &read);
+    AGENT_TEST_ASSERT(res && !strncmp(res, "{\"id\":2,", 8));
+    free(res);
+    agent_tool_call_free(&read);
+
+    /* The tools the sandbox cannot serve are answered where they are refused, and
+     * they cost no request: view_image never even reaches the dispatch. */
+    agent_tool_call blocked[3] = {
+        { (char *)"google_search", NULL, 0, 0 },
+        { (char *)"visit_page", NULL, 0, 0 },
+        { (char *)"view_image", NULL, 0, 0 },
+    };
+    agent_tool_calls calls = { .v = blocked, .len = 3, .cap = 3 };
+    agent_tool_observation obs = agent_execute_tool_observation(&w, &calls);
+    char *joined = test_observation_text(&obs);
+    AGENT_TEST_ASSERT(strstr(joined, "Tool result 1 (google_search):"));
+    AGENT_TEST_ASSERT(strstr(joined,
+                            "google_search is not available in sandbox mode"));
+    AGENT_TEST_ASSERT(strstr(joined,
+                            "visit_page is not available in sandbox mode"));
+    AGENT_TEST_ASSERT(strstr(joined, "Tool result 3 (view_image):"));
+    AGENT_TEST_ASSERT(strstr(joined,
+                            "view_image is not available in sandbox mode"));
+    free(joined);
+    agent_tool_observation_free(&obs);
+
+    /* An unknown name is unknown to the sandbox too, so it is reported without a
+     * request rather than letting the sandbox invent an answer. */
+    agent_tool_call bogus = {0};
+    bogus.name = xstrdup("frobnicate");
+    res = agent_execute_tool_call(&w, &bogus);
+    AGENT_TEST_ASSERT(res && strstr(res, "Tool error: unknown tool: frobnicate"));
+    free(res);
+    AGENT_TEST_ASSERT(strstr(w.out, "[tool:frobnicate] unknown tool"));
+    agent_tool_call_free(&bogus);
+
+    /* Neither the refusals above nor the unknown tool consumed an id. */
+    agent_tool_call again = {0};
+    again.name = xstrdup("read");
+    agent_tool_call_add_arg(&again, "path", "/y", 2, false, NULL);
+    res = agent_execute_tool_call(&w, &again);
+    AGENT_TEST_ASSERT(res && !strncmp(res, "{\"id\":3,", 8));
+    free(res);
+    agent_tool_call_free(&again);
+
+    /* A sandbox that says no is reported as a failed tool, the way a local tool
+     * failure is. */
+    agent_tool_call wr = {0};
+    wr.name = xstrdup("write");
+    agent_tool_call_add_arg(&wr, "path", "/y", 2, false, NULL);
+    res = agent_execute_tool_call(&w, &wr);
+    AGENT_TEST_ASSERT(res && !strcmp(res, "Tool error: read-only path"));
+    free(res);
+    agent_tool_call_free(&wr);
+    agent_sandbox_stop();
+
+    /* An answer over the tool byte limit is cut down here: a sandbox that
+     * over-serves does not get to put a bigger observation in front of the model
+     * than the agent would have written itself. */
+    AGENT_TEST_ASSERT(agent_sandbox_start(SANDBOX_VOLUBILE, NULL, err,
+                                          sizeof(err)));
+    agent_tool_call big = {0};
+    big.name = xstrdup("read");
+    agent_tool_call_add_arg(&big, "path", "/z", 2, false, NULL);
+    res = agent_execute_tool_call(&w, &big);
+    AGENT_TEST_ASSERT(res && strlen(res) < 200000 && strlen(res) > AGENT_TOOL_MAX_BYTES);
+    AGENT_TEST_ASSERT(res && res[0] == 'y');
+    AGENT_TEST_ASSERT(res && strstr(res, "Output truncated at the tool byte limit"));
+    free(res);
+    agent_tool_call_free(&big);
+    agent_sandbox_stop();
+    free(w.out);
+}
+
 static void test_completion(const char *text, linenoiseCompletions *completions) {
     (void)text;
     linenoiseAddCompletion(completions, "example");
@@ -1326,6 +1488,7 @@ int main(int argc, char **argv) {
     test_background_jobs();
     test_sandbox_lifecycle();
     test_sandbox_protocol();
+    test_sandbox_routing();
     test_fragmented_terminal_input();
     test_shell_terminal_controls();
     test_markdown_literals();
