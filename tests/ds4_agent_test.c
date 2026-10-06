@@ -674,6 +674,18 @@ static void test_footer_only_updates(void) {
     fclose(sink);
 }
 
+/* Multi-line prompts are echoed with their continuation lines indented under
+ * the bullet, and single-line prompts are untouched. */
+static void test_prompt_echo(void) {
+    char *msg = agent_format_user_prompt_echo("first\nsecond");
+    AGENT_TEST_ASSERT(msg && strstr(msg, "* first\n  second"));
+    free(msg);
+
+    msg = agent_format_user_prompt_echo("only one line");
+    AGENT_TEST_ASSERT(msg && !strstr(msg, "\n  ") && strstr(msg, "* only one line"));
+    free(msg);
+}
+
 static void test_tool_contracts(void) {
     for (int glm = 0; glm < 3; glm++) {
         for (int vision = 0; vision < 2; vision++) {
@@ -1017,6 +1029,9 @@ int main(int argc, char **argv) {
     agent_config cfg = parse_options((int)(sizeof(options) / sizeof(options[0])), options);
     AGENT_TEST_ASSERT(cfg.engine.vision_path && !strcmp(cfg.engine.vision_path, "mmproj.gguf"));
     AGENT_TEST_ASSERT(cfg.engine.model_path && !strcmp(cfg.engine.model_path, "qwen.gguf"));
+    AGENT_TEST_ASSERT(!cfg.no_multiline_edits);
+    char *no_multiline[] = {"ds4-agent", "--no-multiline-edits", "--non-interactive"};
+    AGENT_TEST_ASSERT(parse_options(3, no_multiline).no_multiline_edits);
     ds4_agent_unit_tests_run();
     test_v41_tool_syntax();
     test_qwen_tool_syntax();
@@ -1030,6 +1045,7 @@ int main(int argc, char **argv) {
     test_shell_terminal_controls();
     test_markdown_literals();
     test_hint_rendering();
+    test_prompt_echo();
     test_unicode_output_and_footer();
     test_footer_only_updates();
     test_tool_contracts();

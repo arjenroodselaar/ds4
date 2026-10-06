@@ -196,6 +196,25 @@ static int maskmode = 0; /* Show "***" instead of input. For passwords. */
 static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int rawmode_output = STDOUT_FILENO; /* fd used for terminal escapes. */
 static int mlmode = 0;  /* Multi line mode. Default is single line. */
+/* ds4-multiline-edits: show and edit newlines inside the edited buffer.  Off by
+ * default, so a caller that has not been taught about multi-row input keeps the
+ * behaviour it has always had. */
+static int multiline_edits = 0;
+
+void linenoiseSetMultilineEdits(int enable) {
+    multiline_edits = enable;
+}
+
+int linenoiseMultilineEdits(void) {
+    return multiline_edits;
+}
+
+/* Return true for text that can now be shown as it is rather than folded away.
+ * Folding existed because a newline could not be displayed; once it can, a
+ * folded paste is just text the user cannot see or edit. */
+static int linenoiseMultilineShowsText(const char *buf, size_t len) {
+    return multiline_edits && memchr(buf, '\n', len) != NULL;
+}
 static int atexit_registered = 0; /* Register atexit just 1 time. */
 static int history_max_len = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
 static int history_len = 0;
@@ -1071,6 +1090,7 @@ static size_t foldCountLines(const char *buf, size_t len) {
 /* Return true if the text should be folded: if it contains newlines or is at
  * least PASTE_FOLD_THRESHOLD bytes long. */
 static int shouldFoldText(const char *buf, size_t len) {
+    if (linenoiseMultilineShowsText(buf, len)) return 0;
     return memchr(buf, '\n', len) != NULL || len >= PASTE_FOLD_THRESHOLD;
 }
 
@@ -1079,6 +1099,7 @@ static int shouldFoldText(const char *buf, size_t len) {
  * it is large or spans many terminal rows. */
 static int shouldFoldHistoryText(const char *buf, size_t len) {
     size_t lines = foldCountLines(buf,len);
+    if (multiline_edits) return 0;
     if (lines <= 1) return len >= HISTORY_FOLD_THRESHOLD;
     return len >= HISTORY_FOLD_THRESHOLD ||
            lines >= HISTORY_FOLD_MULTILINE_LINES;
@@ -1487,7 +1508,409 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
  * prompt, just write it, or both.
  *
  * This function is UTF-8 aware and uses display widths for positioning. */
+
+/* ds4-multiline-edits -- multi-row editing of the prompt input.
+ *
+ * The edit buffer has always been allowed to hold '\n': a bracketed paste puts
+ * real newlines into it and the application submits them unchanged.  What it
+ * could not do was show or edit them, because the refresh path measured the
+ * buffer as one continuous run of columns, and the fold system hid any newline
+ * behind a "[... N pasted lines ...]" marker.
+ *
+ * Everything in this block is the other half: the row geometry, a renderer that
+ * draws one terminal row per line of input (with a viewport, so a large paste
+ * cannot eat the screen), newline-aware motion, and the two keys that insert a
+ * newline.  Those keys are Ctrl+J and Alt+Enter, which every terminal delivers
+ * without negotiating an extended key protocol; plain Enter still submits, as
+ * it always did.
+ *
+ * All of it is opt-in through linenoiseSetMultilineEdits() so callers that have
+ * not been taught about multi-row input keep the previous behaviour exactly,
+ * and the renderer only takes over when the caller installed a layout callback,
+ * which is the configuration where an absolute prompt row is known. */
+
+/* Defined below with the other editing primitives. */
+int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
+
+/* One terminal row of the input block, in render coordinates. */
+struct linenoiseRow {
+    size_t start;    /* first byte drawn on this row */
+    size_t end;      /* one past the last byte drawn, or the '\n' itself */
+    int width;       /* display width of what is drawn on this row */
+};
+
+struct linenoiseRowMap {
+    struct linenoiseRow *row;
+    int rows;        /* rows built, including the one being built at push time */
+    int capacity;
+    int cursor_row;  /* row holding the cursor */
+    int cursor_col;  /* display column of the cursor within that row */
+    int extra_row;   /* cursor sits past the end of the last row, so it needs one */
+};
+
+static void linenoiseRowMapFree(struct linenoiseRowMap *m) {
+    free(m->row);
+    m->row = NULL;
+    m->rows = m->capacity = 0;
+}
+
+static int linenoiseRowMapPush(struct linenoiseRowMap *m, size_t start, size_t end,
+                               int width) {
+    if (m->rows == m->capacity) {
+        int capacity = m->capacity ? m->capacity * 2 : 16;
+        struct linenoiseRow *grown = realloc(m->row, sizeof(*m->row) * (size_t)capacity);
+        if (grown == NULL) return -1;
+        m->row = grown;
+        m->capacity = capacity;
+    }
+    m->row[m->rows].start = start;
+    m->row[m->rows].end = end;
+    m->row[m->rows].width = width;
+    m->rows++;
+    return 0;
+}
+
+/* Break the rendered buffer into the rows the terminal will show.  The prompt
+ * occupies the first `pwidth` columns of row 0, and a row wraps when the next
+ * grapheme would not fit -- the same rule the single-line path approximates
+ * with division, applied here one row at a time. */
+static int linenoiseRowMapBuild(struct linenoiseState *l, const char *render,
+                                size_t render_len, size_t render_pos, int pwidth,
+                                struct linenoiseRowMap *m) {
+    int cols = l->cols ? (int)l->cols : 80;
+    size_t i = 0, start = 0;
+    int col = pwidth > 0 ? pwidth : 0;
+
+    memset(m, 0, sizeof(*m));
+    if (col >= cols) col = 0;    /* a prompt at least a screen wide starts row two */
+
+    while (i < render_len) {
+        if (i == render_pos) {
+            m->cursor_row = m->rows;
+            m->cursor_col = col;
+        }
+        if (render[i] == '\n') {
+            if (linenoiseRowMapPush(m, start, i, col) == -1) return -1;
+            i++;
+            start = i;
+            col = 0;
+            continue;
+        }
+        int width = 0;
+        size_t glen = linenoiseNextGrapheme(render + i, render_len - i, &width);
+        if (glen == 0) glen = 1;
+        if (col + width > cols && col > 0) {
+            if (linenoiseRowMapPush(m, start, i, col) == -1) return -1;
+            start = i;
+            col = 0;
+        }
+        col += width;
+        i += glen;
+    }
+
+    if (render_pos >= render_len) {
+        m->cursor_row = m->rows;
+        m->cursor_col = col;
+    }
+    if (linenoiseRowMapPush(m, start, render_len, col) == -1) return -1;
+
+    /* A cursor exactly at the right margin of the last row belongs on the row
+     * below it, which is what the single-line path's cursor_wrap_row did. */
+    if (m->cursor_col >= cols && m->cursor_row == m->rows - 1) {
+        m->extra_row = 1;
+        m->cursor_row++;
+        m->cursor_col = 0;
+    }
+    return 0;
+}
+
+/* The most rows the input block may occupy.  The application reserves the same
+ * amount for the prompt plus the status footer, and keeps at least two rows of
+ * terminal for output above it. */
+static int linenoiseMultilineMaxRows(struct linenoiseState *l) {
+    struct winsize ws;
+    if (ioctl(l->ofd, TIOCGWINSZ, &ws) != 0 || ws.ws_row < 4) return 0;
+    int rows = (int)ws.ws_row - 2 - linenoiseStatusRows(l);
+    return rows < 1 ? 1 : rows;
+}
+
+/* Draw the prompt block as one row per line of input.  Returns -1 if this
+ * refresh is not the multi-line renderer's to handle, in which case nothing has
+ * been written and the caller draws it the way it always did. */
+static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
+    if (!multiline_edits || !l->layout_callback) return -1;
+    if (!(flags & (REFRESH_CLEAN | REFRESH_WRITE))) return -1;
+
+    char *render = NULL;
+    size_t render_len, render_pos;
+    if (linenoiseRenderBuffer(l, &render, &render_len, &render_pos) == -1) return -1;
+    if (memchr(render, '\n', render_len) == NULL) {
+        free(render);
+        return -1;
+    }
+
+    int pwidth = (int)utf8StrWidth(l->prompt, l->plen);
+    struct linenoiseRowMap map;
+    if (linenoiseRowMapBuild(l, render, render_len, render_pos, pwidth, &map) == -1) {
+        linenoiseRowMapFree(&map);  /* partially built; the builder zeroed it first */
+        free(render);
+        return -1;
+    }
+
+    int total_rows = map.rows + map.extra_row;
+    int statusrows = linenoiseStatusRows(l);
+    int max_rows = linenoiseMultilineMaxRows(l);
+    int top = 0, shown = total_rows, markers = 0;
+    if (max_rows > 0 && total_rows > max_rows) {
+        shown = max_rows - 2;
+        if (shown < 1) shown = 1;
+        top = map.cursor_row - shown / 2;
+        if (top > total_rows - shown) top = total_rows - shown;
+        if (top < 0) top = 0;
+        markers = (top > 0 ? 1 : 0) + (top + shown < total_rows ? 1 : 0);
+    }
+    int drawn_rows = shown + markers;
+    int cursor_draw_row = map.cursor_row - top + (top > 0 ? 1 : 0);
+
+    char seq[64];
+    struct abuf ab;
+    abInit(&ab);
+    int fd = l->ofd, j;
+
+    /* Clearing follows the single-line and multi-line paths exactly: go to the
+     * bottom of the block written last time, clear upwards, clear the top. */
+    if (flags & REFRESH_CLEAN) {
+        int old_total_rows = (int)l->oldrows + (int)l->oldstatusrows;
+        int rpos = l->oldrpos;
+        if (old_total_rows - rpos > 0) {
+            snprintf(seq, sizeof(seq), "\x1b[%dB", old_total_rows - rpos);
+            abAppend(&ab, seq, strlen(seq));
+        }
+        for (j = 0; j < old_total_rows - 1; j++)
+            abAppend(&ab, "\r\x1b[0K\x1b[1A", 9);
+        if (old_total_rows > 0)
+            abAppend(&ab, "\r\x1b[0K", 5);
+    }
+
+    /* Let the owner resize and reposition the reserved area before drawing, as
+     * the other refresh paths do: rows that were output become input rows. */
+    int layout_prompt_row = 0;
+    if ((flags & REFRESH_WRITE) && l->layout_callback) {
+        if (linenoiseWrite(fd, ab.b, ab.len) == -1) {}
+        abFree(&ab);
+        abInit(&ab);
+        layout_prompt_row = l->layout_callback(l, (size_t)drawn_rows,
+                                               (size_t)statusrows, l->layout_privdata);
+    }
+
+    if (!(flags & REFRESH_WRITE)) {
+        l->oldrows = 0;
+        l->oldstatusrows = 0;
+        l->oldrpos = 1;
+        l->screen_cursor_row = 0;
+        l->screen_cursor_col = 0;
+        if (linenoiseWrite(fd, ab.b, ab.len) == -1) {}
+        abFree(&ab);
+        linenoiseRowMapFree(&map);
+        free(render);
+        return 0;
+    }
+
+    for (int r = 0; r < drawn_rows; r++) {
+        int marker_row = (top > 0 && r == 0) ||
+                         (markers > (top > 0 ? 1 : 0) && r == drawn_rows - 1);
+        if (layout_prompt_row > 0) {
+            snprintf(seq, sizeof(seq), "\x1b[%d;1H\x1b[0K", layout_prompt_row + r);
+            abAppend(&ab, seq, strlen(seq));
+        } else {
+            abAppend(&ab, "\r\x1b[0K", 5);
+            if (r > 0) abAppend(&ab, "\n", 1);
+        }
+        if (marker_row) {
+            /* The input is longer than the space the terminal has for it. */
+            int hidden = (r == 0) ? top : total_rows - (top + shown);
+            snprintf(seq, sizeof(seq), "\x1b[2m... %d line%s ...\x1b[0m",
+                     hidden, hidden == 1 ? "" : "s");
+            abAppend(&ab, seq, strlen(seq));
+            continue;
+        }
+        int content_row = top + r - (top > 0 ? 1 : 0);
+        /* A cursor at the right margin needs a row below the last one; that row
+         * is cleared and holds the cursor, but there is no text to draw in it. */
+        if (content_row >= map.rows) continue;
+        if (r == (top > 0 ? 1 : 0)) abAppend(&ab, l->prompt, l->plen);
+        if (maskmode == 1) {
+            size_t i = map.row[content_row].start;
+            size_t end = map.row[content_row].end;
+            while (i < end) {
+                abAppend(&ab, "*", 1);
+                i += utf8NextCharLen(render, i, end);
+            }
+        } else {
+            abAppend(&ab, render + map.row[content_row].start,
+                     map.row[content_row].end - map.row[content_row].start);
+        }
+        if (content_row == top + shown - 1 || content_row == map.rows - 1)
+            refreshShowHints(&ab, l, r == (top > 0 ? 1 : 0) ? pwidth : 0,
+                             (size_t)map.row[content_row].width);
+    }
+
+    if (statusrows > 0)
+        refreshStatusLine(&ab, l, layout_prompt_row > 0 ? layout_prompt_row + drawn_rows : 0);
+
+    if (layout_prompt_row > 0) {
+        l->screen_cursor_row = layout_prompt_row + cursor_draw_row;
+        l->screen_cursor_col = 1 + map.cursor_col;
+        snprintf(seq, sizeof(seq), "\x1b[%d;%dH", l->screen_cursor_row,
+                 l->screen_cursor_col);
+        abAppend(&ab, seq, strlen(seq));
+    } else {
+        int rows_below = drawn_rows - 1 - cursor_draw_row;
+        if (rows_below > 0) {
+            snprintf(seq, sizeof(seq), "\x1b[%dA", rows_below);
+            abAppend(&ab, seq, strlen(seq));
+        }
+        if (map.cursor_col)
+            snprintf(seq, sizeof(seq), "\r\x1b[%dC", map.cursor_col);
+        else
+            snprintf(seq, sizeof(seq), "\r");
+        abAppend(&ab, seq, strlen(seq));
+        l->screen_cursor_row = 0;
+        l->screen_cursor_col = 0;
+    }
+
+    l->oldpos = l->pos;
+    l->oldrows = (size_t)drawn_rows;
+    l->oldstatusrows = (size_t)statusrows;
+    l->oldrpos = cursor_draw_row + 1;
+
+    if (linenoiseWrite(fd, ab.b, ab.len) == -1) {}
+    abFree(&ab);
+    linenoiseRowMapFree(&map);
+    free(render);
+    return 0;
+}
+
+/* ds4-multiline editing operations. */
+
+int linenoiseEditInsertNewline(struct linenoiseState *l) {
+    return linenoiseEditInsert(l, "\n", 1);
+}
+
+/* Return the byte offset of the first character of the visual row under pos,
+ * and of the end of that row, using the same geometry the renderer uses. */
+static void linenoiseMultilineRowBounds(struct linenoiseState *l, size_t pos,
+                                        size_t *start, size_t *end) {
+    size_t i;
+
+    if (start) {
+        *start = 0;
+        for (i = pos; i > 0; i--) {
+            if (l->buf[i - 1] == '\n') {
+                *start = i;
+                break;
+            }
+        }
+    }
+    if (end) {
+        *end = l->len;
+        for (i = pos; i < l->len; i++) {
+            if (l->buf[i] == '\n') {
+                *end = i;
+                break;
+            }
+        }
+    }
+}
+
+/* Move to the previous or next line.  Returns 0 when there is no such line,
+ * which is when the caller should do what it always did and walk history.
+ * The display column is kept where it can be: the desired column is remembered
+ * for as long as the buffer is the length it was when the column was picked,
+ * which is what makes repeated up/down moves feel like one column. */
+static int linenoiseEditMoveLine(struct linenoiseState *l, int dir) {
+    if (!multiline_edits || memchr(l->buf, '\n', l->len) == NULL) return 0;
+
+    size_t start, end;
+    linenoiseMultilineRowBounds(l, l->pos, &start, &end);
+
+    int desired = l->ml_wanted_col >= 0 && l->ml_wanted_len == l->len ?
+                  l->ml_wanted_col : (int)utf8StrWidth(l->buf + start, l->pos - start);
+
+    if (dir < 0) {
+        if (start == 0) return 0;
+        l->pos = start - 1;                    /* the newline ending the row above */
+    } else {
+        if (end == l->len) return 0;
+        l->pos = end + 1;                      /* just past the newline */
+    }
+    linenoiseMultilineRowBounds(l, l->pos, &start, &end);
+
+    size_t i = start;
+    int col = 0;
+    while (i < end && col < desired) {
+        int width = 0;
+        size_t glen = linenoiseNextGrapheme(l->buf + i, end - i, &width);
+        if (glen == 0) glen = 1;
+        if (col + width > desired && width > 1) break;
+        col += width;
+        i += glen;
+    }
+    l->pos = i;
+    l->ml_wanted_col = desired;
+    l->ml_wanted_len = l->len;
+    refreshLine(l);
+    return 1;
+}
+
+static void linenoiseEditMoveLineHome(struct linenoiseState *l) {
+    if (!multiline_edits || memchr(l->buf, '\n', l->len) == NULL) return;
+    size_t start, end;
+    linenoiseMultilineRowBounds(l, l->pos, &start, &end);
+    (void)end;
+    if (l->pos == start) return;
+    l->pos = start;
+    l->ml_wanted_col = 0;
+    l->ml_wanted_len = l->len;
+    refreshLine(l);
+}
+
+static void linenoiseEditMoveLineEnd(struct linenoiseState *l) {
+    if (!multiline_edits || memchr(l->buf, '\n', l->len) == NULL) return;
+    size_t start, end;
+    linenoiseMultilineRowBounds(l, l->pos, &start, &end);
+    (void)start;
+    if (l->pos == end) return;
+    l->pos = end;
+    l->ml_wanted_col = (int)utf8StrWidth(l->buf + start, end - start);
+    l->ml_wanted_len = l->len;
+    refreshLine(l);
+}
+
+/* Delete from the cursor to the end of the current line, or to the end of the
+ * buffer when the line ends the buffer. */
+static void linenoiseEditKillLineEnd(struct linenoiseState *l) {
+    size_t start, end;
+    linenoiseMultilineRowBounds(l, l->pos, &start, &end);
+    (void)start;
+    size_t killed = end - l->pos;
+    if (killed == 0) return;
+    /* The rest of the buffer moves up over what was killed; only a kill that
+     * reached the end of the buffer is a plain truncation. */
+    memmove(l->buf + l->pos, l->buf + end, l->len - end);
+    l->len -= killed;
+    l->buf[l->len] = '\0';
+    linenoiseAdjustFoldsAfterDelete(l, l->pos, killed);
+    l->ml_wanted_col = -1;
+    refreshLine(l);
+}
+
 static void refreshMultiLine(struct linenoiseState *l, int flags) {
+    /* ds4-multiline-edits: input holding a newline is drawn by its own
+     * renderer, which writes nothing and declines when there is no newline to
+     * draw. */
+    if (linenoiseRefreshNewlines(l, flags) == 0) return;
+
     char seq[64];
     size_t pwidth = utf8StrWidth(l->prompt, l->plen);  /* Prompt display width */
     char *render = NULL;
@@ -1696,6 +2119,8 @@ void linenoiseEditClear(struct linenoiseState *l) {
     l->pos = 0;
     l->oldpos = 0;
     l->in_completion = 0;
+    l->ml_wanted_col = -1;    /* ds4-multiline-edits */
+    l->ml_wanted_len = 0;
     linenoiseFoldClear(l);
     refreshLine(l);
 }
@@ -1891,6 +2316,13 @@ void linenoiseEditMoveRight(struct linenoiseState *l) {
 
 /* Move cursor to the start of the line. */
 void linenoiseEditMoveHome(struct linenoiseState *l) {
+    /* ds4-multiline-edits: the first Home goes to the start of this line, and
+     * a second one to the start of the buffer. */
+    if (multiline_edits && memchr(l->buf, '\n', l->len) != NULL) {
+        size_t before = l->pos;
+        linenoiseEditMoveLineHome(l);
+        if (before != l->pos) return;
+    }
     if (l->pos != 0) {
         l->pos = 0;
         refreshLine(l);
@@ -1899,6 +2331,13 @@ void linenoiseEditMoveHome(struct linenoiseState *l) {
 
 /* Move cursor to the end of the line. */
 void linenoiseEditMoveEnd(struct linenoiseState *l) {
+    /* ds4-multiline-edits: the first End goes to the end of this line, and a
+     * second one to the end of the buffer. */
+    if (multiline_edits && memchr(l->buf, '\n', l->len) != NULL) {
+        size_t before = l->pos;
+        linenoiseEditMoveLineEnd(l);
+        if (before != l->pos) return;
+    }
     if (l->pos != l->len) {
         l->pos = l->len;
         refreshLine(l);
@@ -2031,6 +2470,8 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->prompt = prompt;
     l->plen = strlen(prompt);
     l->oldpos = l->pos = 0;
+    l->ml_wanted_col = -1;    /* ds4-multiline */
+    l->ml_wanted_len = 0;
     l->len = 0;
     l->status = NULL;
     l->status_start = NULL;
@@ -2307,6 +2748,14 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
     }
     if (l->pending_key_len) {
         if (l->pending_key_len == 1 && c != '[' && c != 'O') {
+            /* ds4-multiline-edits: Alt+Enter adds a newline.  Without this the
+             * ESC is dropped, the CR that follows submits, and Alt+Enter is
+             * Enter. */
+            if (multiline_edits && (c == '\r' || c == '\n')) {
+                l->pending_key_len = 0;
+                if (linenoiseEditInsertNewline(l)) return NULL;
+                return linenoiseEditMore;
+            }
             l->pending_key_len = 0; /* Preserve the character after a lone ESC. */
         } else {
             l->pending_key[l->pending_key_len++] = c;
@@ -2390,10 +2839,12 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         linenoiseEditMoveRight(l);
         break;
     case CTRL_P:    /* ctrl-p */
-        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
+        if (!linenoiseEditMoveLine(l, -1))
+            linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
         break;
     case CTRL_N:    /* ctrl-n */
-        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
+        if (!linenoiseEditMoveLine(l, 1))
+            linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
         break;
     case ESC:    /* escape sequence */
         if (seq[0] == '[' || seq[0] == 'O') {
@@ -2404,10 +2855,12 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             } else {
                 switch(seq[seq_len - 1]) {
                 case 'A': /* Up */
-                    linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
+                    if (!linenoiseEditMoveLine(l, -1))
+                        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
                     break;
                 case 'B': /* Down */
-                    linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
+                    if (!linenoiseEditMoveLine(l, 1))
+                        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
                     break;
                 case 'C': /* Right */
                     linenoiseEditMoveRight(l);
@@ -2426,6 +2879,9 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         }
 
         break;
+    case '\n':    /* ds4-multiline-edits: ctrl-j adds a newline */
+        if (multiline_edits && linenoiseEditInsertNewline(l)) return NULL;
+        break;
     default:
         if ((unsigned char)c >= 0x80) {
             if (linenoiseEditInsert(l, "\xef\xbf\xbd", 3)) return NULL;
@@ -2438,6 +2894,12 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         refreshLine(l);
         break;
     case CTRL_K: /* Ctrl+k, delete from current to end of line. */
+        /* ds4-multiline-edits: "end of line" means this line, not the whole
+         * buffer. */
+        if (multiline_edits && memchr(l->buf, '\n', l->len) != NULL) {
+            linenoiseEditKillLineEnd(l);
+            break;
+        }
         linenoiseAdjustFoldsAfterDelete(l,l->pos,l->len-l->pos);
         l->buf[l->pos] = '\0';
         l->len = l->pos;

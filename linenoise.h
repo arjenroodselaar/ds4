@@ -88,6 +88,8 @@ struct linenoiseState {
     void *layout_privdata;
     int screen_cursor_row; /* Absolute terminal cursor row after last refresh. */
     int screen_cursor_col; /* Absolute terminal cursor col after last refresh. */
+    int ml_wanted_col;  /* ds4-multiline-edits: display column wanted by up/down. */
+    size_t ml_wanted_len; /* Buffer length when that column was chosen. */
     char *queued_input; /* Bytes already read by an outer event loop. */
     size_t queued_input_len;
     size_t queued_input_pos;
@@ -151,6 +153,11 @@ int linenoiseHistoryLoad(const char *filename);
 /* Other utilities. */
 void linenoiseClearScreen(void);
 void linenoiseSetMultiLine(int ml);
+/* ds4-multiline-edits: allow '\n' inside the edited buffer to be shown and
+ * edited. Off by default; plain Enter submits whether or not this is on. */
+void linenoiseSetMultilineEdits(int enable);
+int linenoiseMultilineEdits(void);
+int linenoiseEditInsertNewline(struct linenoiseState *l);
 void linenoisePrintKeyCodes(void);
 void linenoiseMaskModeEnable(void);
 void linenoiseMaskModeDisable(void);
