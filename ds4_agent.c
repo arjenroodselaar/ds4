@@ -93,6 +93,7 @@ typedef struct {
     const char *sandbox_cmd;
     bool non_interactive;
     bool edit_upto;
+    bool no_multiline_edits;
 } agent_config;
 
 typedef enum {
@@ -908,6 +909,8 @@ static agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.sandbox_cmd = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--no-multiline-edits")) {
+            c.no_multiline_edits = true;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -12290,15 +12293,31 @@ static bool stdout_is_tty(void) {
     return isatty(STDOUT_FILENO) != 0;
 }
 
+/* Prompts may hold newlines (Ctrl+J, Alt+Enter, or a pasted block).  Their
+ * continuation lines are lined up under the text after the "*" bullet rather
+ * than starting at column one. */
+static void agent_buf_puts_indented(agent_buf *b, const char *text,
+                                    const char *continuation) {
+    size_t start = 0, i = 0;
+    while (text[i]) {
+        if (text[i] != '\n') { i++; continue; }
+        agent_buf_append(b, text + start, i - start);
+        agent_buf_puts(b, "\n");
+        agent_buf_puts(b, continuation);
+        start = ++i;
+    }
+    agent_buf_append(b, text + start, i - start);
+}
+
 static char *agent_format_user_prompt_echo(const char *text) {
     agent_buf b = {0};
     if (stdout_is_tty()) {
         agent_buf_puts(&b, "\x1b[1;91m*\x1b[1;97m ");
-        agent_buf_puts(&b, text);
+        agent_buf_puts_indented(&b, text, "  ");
         agent_buf_puts(&b, "\x1b[0m\n\n");
     } else {
         agent_buf_puts(&b, "* ");
-        agent_buf_puts(&b, text);
+        agent_buf_puts_indented(&b, text, "  ");
         agent_buf_puts(&b, "\n\n");
     }
     return agent_buf_take(&b);
@@ -13561,6 +13580,8 @@ static void runtime_help(void) {
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
     puts("  Enter        Queue text while the agent is busy.");
+    puts("  Ctrl+J       Add a newline to the prompt; Alt+Enter also does.");
+    puts("  Up, Down     Move between prompt lines, or history at the edges.");
     puts("  Ctrl+X       Edit the first queued prompt.");
     puts("  ESC          Interrupt and send queued prompt immediately.");
     puts("  Ctrl+D       Exit from an empty prompt.");
@@ -14000,6 +14021,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
      * tokens do not require repainting the bottom rows.  Terminals without
      * scroll-region support fall back to the older prompt-below-output path. */
     linenoiseSetMultiLine(1);
+    linenoiseSetMultilineEdits(cfg->no_multiline_edits ? 0 : 1);
     linenoiseHistorySetMaxLen(512);
     linenoiseHistoryLoad(hist);
     agent_completion_worker = &worker;

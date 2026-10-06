@@ -323,6 +323,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--sandbox CMD", "Run this shell command for the whole session as the tool sandbox.");
+    opt(fp, c, "--no-multiline-edits", "Fold a multi-line prompt instead of editing it line by line.");
     fputc('\n', fp);
 }
 
