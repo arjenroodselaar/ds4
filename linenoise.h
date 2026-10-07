@@ -76,6 +76,8 @@ struct linenoiseState {
     size_t cols;        /* Number of columns in terminal. */
     size_t oldrows;     /* Rows used by last refreshed line (multiline mode) */
     size_t oldstatusrows; /* Extra status rows used by last refresh. */
+    int status_row;     /* ds4-multiline: absolute footer row, 0 = below prompt. */
+    int oldstatusgap;   /* ds4-multiline: blank rows above that footer, last time. */
     int oldrpos;        /* Cursor row from last refresh (for multiline clearing). */
     int history_index;  /* The history index we are currently editing. */
     int fold_count;    /* Number of folded ranges. */
@@ -115,6 +117,7 @@ size_t linenoiseEditQueuedInput(struct linenoiseState *l);
 void linenoiseEditClear(struct linenoiseState *l);
 int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
                            const char *start_escape, const char *end_escape);
+void linenoiseSetStatusRow(struct linenoiseState *l, int row);
 void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
                                     linenoiseLayoutCallback *fn,
                                     void *privdata);

@@ -12635,7 +12635,8 @@ typedef struct {
     int term_cols;
     int output_bottom;
     int prompt_row;
-    int reserved_rows;
+    int reserved_rows;   /* Sticky: never shrinks while the terminal size holds. */
+    int status_row;      /* Absolute row the footer is pinned to. */
     bool output_cursor_saved;
     bool output_at_scroll_boundary;
     agent_input_buf deferred_output;
@@ -13051,8 +13052,12 @@ static void editor_scroll_output_up(int bottom, int lines) {
         write_all(STDOUT_FILENO, "\n", 1);
 }
 
+/* Reserve @reserved_rows at the bottom of the screen for the prompt block plus
+ * a @status_rows footer, and pin the footer to the last row.  The reservation is
+ * sticky: rows a shrinking prompt gives back stay inside the prompt area, so
+ * the block keeps its place under the output and the transcript never moves. */
 static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
-                                     bool allow_shrink,
+                                     int status_rows,
                                      bool scroll_on_grow) {
     if (!ed->scroll_region) return false;
 
@@ -13061,7 +13066,7 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
     if (rows < 8 || cols < 20) return false;
     if (reserved_rows < 2) reserved_rows = 2;
     if (reserved_rows > rows - 2) reserved_rows = rows - 2;
-    if (!allow_shrink && ed->reserved_rows > 0 &&
+    if (ed->reserved_rows > 0 &&
         ed->term_rows == rows && ed->term_cols == cols &&
         reserved_rows < ed->reserved_rows)
     {
@@ -13070,19 +13075,20 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
 
     int output_bottom = rows - reserved_rows;
     int prompt_row = output_bottom + 1;
+    int footer_row = status_rows > 0 ? rows - status_rows + 1 : 0;
     bool changed = ed->term_rows != rows ||
                    ed->term_cols != cols ||
                    ed->output_bottom != output_bottom ||
                    ed->prompt_row != prompt_row ||
-                   ed->reserved_rows != reserved_rows;
+                   ed->reserved_rows != reserved_rows ||
+                   ed->status_row != footer_row;
     if (!changed) return true;
 
     /* If the prompt grows, rows that were output rows become prompt rows.  Do
      * not simply clear them: first scroll the old output region upward by the
      * number of newly reserved rows, exactly as if the model had printed more
-     * lines.  If the prompt shrinks, no output is restored; the output region
-     * simply grows downward and the prompt/status block remains bottom
-     * anchored. */
+     * lines.  Because the reservation is sticky the prompt never gives rows
+     * back to the output, so nothing has to be restored underneath it. */
     bool scrolled_output = false;
     if (scroll_on_grow &&
         ed->term_rows == rows && ed->term_cols == cols &&
@@ -13100,6 +13106,8 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
     ed->output_bottom = output_bottom;
     ed->prompt_row = prompt_row;
     ed->reserved_rows = reserved_rows;
+    ed->status_row = footer_row;
+    linenoiseSetStatusRow(&ed->edit, footer_row);
     ed->output_cursor_saved = false;
     ed->output_at_scroll_boundary = scrolled_output;
 
@@ -13128,7 +13136,7 @@ static int editor_linenoise_layout_changed(struct linenoiseState *l,
     if (!ed || !ed->scroll_region) return 0;
     if (prompt_rows < 1) prompt_rows = 1;
     int reserved = (int)(prompt_rows + status_rows);
-    if (!editor_set_scroll_layout(ed, reserved, true, true)) return 0;
+    if (!editor_set_scroll_layout(ed, reserved, (int)status_rows, true)) return 0;
     return ed->prompt_row;
 }
 
@@ -13149,10 +13157,11 @@ static bool editor_configure_scroll_region(agent_editor *ed) {
     ed->output_bottom = 0;
     ed->prompt_row = 0;
     ed->reserved_rows = 0;
+    ed->status_row = 0;
     ed->output_cursor_saved = false;
     ed->output_at_scroll_boundary = false;
     ed->scroll_region = true;
-    if (!editor_set_scroll_layout(ed, 2, true, false)) return false;
+    if (!editor_set_scroll_layout(ed, 2, 1, false)) return false;
 
     /* The agent prints backend startup lines before the editor exists.  Once
      * the scroll region is installed, create an append line at the bottom of
@@ -13178,6 +13187,7 @@ static void editor_restore_terminal_layout(agent_editor *ed) {
     ed->term_rows = ed->term_cols = 0;
     ed->output_bottom = ed->prompt_row = 0;
     ed->reserved_rows = 0;
+    ed->status_row = 0;
     ed->output_at_scroll_boundary = false;
 }
 
@@ -13191,7 +13201,7 @@ static int editor_start(agent_editor *ed, const char *prompt,
     bool use_scroll_region = editor_configure_scroll_region(ed);
     if (use_scroll_region) {
         if (had_scroll_region)
-            editor_set_scroll_layout(ed, 2, true, false);
+            editor_set_scroll_layout(ed, 2, 1, false);
         editor_move_to_prompt_row(ed);
     }
     if (linenoiseEditStart(&ed->edit, STDIN_FILENO, STDOUT_FILENO,
@@ -13247,6 +13257,12 @@ static void editor_stop(agent_editor *ed) {
     if (!ed->hidden && (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")))
         editor_hide(ed);
     linenoiseEditStop(&ed->edit);
+    /* Drop the sticky reservation so the next layout call hands the rows a tall
+     * prompt borrowed back to the output.  Nothing is written here: the caller
+     * echoes the accepted prompt and slash-command output at the cursor that
+     * linenoiseEditStop() left, and relayouting now would move that cursor onto
+     * the row the next prompt is drawn on, erasing what is printed there. */
+    ed->reserved_rows = 0;
     if (ed->old_stdin_flags >= 0) fcntl(STDIN_FILENO, F_SETFL, ed->old_stdin_flags);
     free(ed->edit.buf);
     ed->input = NULL;
