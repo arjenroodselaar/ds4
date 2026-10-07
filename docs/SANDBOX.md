@@ -11,14 +11,17 @@ lives in the "Sandbox Subprocess" section of `ds4_agent.c`.
 
 ## Process lifecycle
 
-- The sandbox starts **before** the model is loaded, so a command that cannot
-  run fails in milliseconds with the shell's own message instead of after a
-  minutes-long load.
+- The sandbox starts **before** the model is loaded, and the agent does not open
+  the engine until the sandbox has announced itself.  A command that cannot run
+  therefore fails in milliseconds with the shell's own message instead of after a
+  minutes-long load.  See **Startup handshake**.
 - Environment is deliberately small: `DS4_SANDBOX=1`, plus `PATH`, `HOME` and
   `TMPDIR` copied from the agent.  Everything else is the sandbox's business.
 - The child is its own process group leader, so teardown reaches grandchildren.
 - Teardown closes stdin, then escalates SIGTERM to SIGKILL for the group.  It
-  runs on every exit path, including the paths that leave through `exit()`.
+  runs on every exit path, including the paths that leave through `exit()`, and
+  including an agent interrupted while it waits for the startup notice: the wait
+  may be abandoned, the process group may not.
 - A sandbox that dies or is killed ends the session: the interactive REPL takes
   exactly the `/exit` path (including the offer to save the transcript) and the
   non-interactive mode prints the reason to stderr and exits 1.  Both notice at
@@ -26,6 +29,60 @@ lives in the "Sandbox Subprocess" section of `ds4_agent.c`.
   first.
 - If a write fails with `EPIPE`, the agent reports it.  The agent ignores
   `SIGPIPE` from the moment the child exists.
+
+## Startup handshake
+
+A sandbox announces that it is usable with one notice, written before it reads
+anything:
+
+```json
+{"id":0,"type":"log","text":"ds4-sandbox-helper 0.1.0 ready: read_lines default 240, edit_upto=4096"}
+```
+
+- The **first frame** a sandbox writes is an id-0 notice whose `text` contains the
+  word `ready`, matched ASCII case-insensitively.  Everything a user should be
+  told about the sandbox — implementation and version, the caps it settled on, the
+  directory it works in — belongs in that line, because it is the only thing the
+  agent prints on its account.  Detection keys on the word and not on `type`: a
+  sandbox that prefers `"type":"ready"` may send it, and one that buries the word
+  in a longer sentence is still understood.
+- Write the notice and flush it at startup, **before reading stdin**.  A sandbox
+  that waits for its first request before announcing itself never receives one,
+  because the agent is waiting for the notice.
+- The agent blocks on the notice, and blocks before it opens the engine.  This is
+  the point of the handshake: without it the agent loads a model for minutes and
+  then discovers in the first tool call that there is no sandbox.  The price is
+  that a sandbox which stays alive and never says `ready` stops the run with both
+  processes healthy and nothing printed.  That trade is accepted for startup;
+  the unbounded wait per request is a separate, open question under **Open:
+  nothing bounds the wait**.
+- The wait ends on the first of these, and on nothing else:
+
+  | Event | Outcome |
+  |---|---|
+  | a notice whose `text` contains `ready` | startup complete, and the notice is printed |
+  | the child exits, or both its pipes reach EOF | startup failure, with the exit status and the newest stderr |
+  | a framing or protocol fault on anything the sandbox writes | startup failure, naming the fault |
+  | a frame with a non-zero `id` before the agent has sent a request | startup failure: there is nothing that frame could answer |
+
+  A command that is missing, unparseable or instantly broken is caught by the
+  second and third rows, so this replaces the short timed grace the agent waits
+  out today rather than putting a deadline on top of it.  What remains unbounded
+  is a live sandbox that says nothing.  A startup failure is reported on stderr
+  and the agent exits without loading a model.
+- Until the notice arrives, every complete line the sandbox writes to **stderr**
+  is echoed as `sandbox: <line>`, because that is where a misconfigured command
+  explains itself.  From the notice onward stderr returns to being a tail, a
+  trace mirror and a failure reason: echoing it for the rest of the run would
+  break the rule in **Channels** that nothing out of band reaches the
+  conversation.  A line is echoed once it is complete, so a sandbox that reports
+  progress without newlines is not echoed until it ends.
+- The notice itself is printed once, as `sandbox: <text>` on stderr, beside the
+  model-loading messages, and appended to the trace log when `--trace` is set.
+  It is not part of the conversation and never reaches the model.
+- Saying `ready` is not a promise of continued health.  A sandbox that dies
+  afterwards takes the ordinary mid-run death path under **Process lifecycle**,
+  not the startup failure path.
 
 ## Channels
 
@@ -39,6 +96,12 @@ The sandbox folds the stderr of the work it performs into the `result` text it
 reports, so nothing out of band can reach the conversation.  Agent stderr is
 drained continuously, kept as a short tail, mirrored to `<trace_path>.sandbox.log`
 when `--trace` is set, and included in the failure reason when the sandbox dies.
+Startup stderr is the one exception, described in **Startup handshake**.
+
+Everything the sandbox wants the agent to see, including its startup notice, is a
+frame.  A banner printed as a bare line on stdout is not a greeting but a fault:
+the agent reads the first line of every frame as a byte count, and text is not
+one.
 
 ## Framing
 
@@ -133,9 +196,13 @@ not a sandbox fault.
 ```
 
 A notice is a frame with `id` 0.  It never completes a request and never reaches
-the model.  The agent appends it to the trace output (`agent_trace()`), which
-means it is dropped entirely without `--trace`, and it does not count as activity
-for any timeout.  Extra members are allowed.
+the model.  The agent appends it to `<trace_path>.sandbox.log`, which means it is
+dropped entirely without `--trace`, and it does not count as activity for any
+timeout.  Extra members are allowed.
+
+The startup notice is the exception: it is the one notice the agent waits for and
+the one it prints, as described in **Startup handshake**.  Notices after it stay
+diagnostics.
 
 ## Failures
 
@@ -151,7 +218,9 @@ Recoverable, and only the affected call fails:
 - a response over 4 MiB: the frame is discarded, byte-counted out of the stream
   without buffering it, and the waiting request is answered with an error;
 - a request over 1 MiB: never written;
-- a response for an unknown or abandoned `id`: dropped.
+- a response for an unknown or abandoned `id`: dropped.  Before the agent has
+  sent its first request there is nothing that frame could be answering, and it
+  fails startup instead.
 
 ## Open: nothing bounds the wait
 
@@ -170,6 +239,14 @@ the abandoned-request rule already makes its late answer harmless.  Nothing like
 it is implemented yet, so a sandbox that wants to be robust on its own has to
 bound the work it does per request (`bash` has `timeout_sec` for exactly this
 reason) rather than rely on the agent to time it out.
+
+The startup wait is unbounded by decision and is not this open question.  A
+sandbox that never says `ready` has not started, and the agent would rather stop
+before a minutes-long model load than after it, so it waits as long as the child
+lives and prints nothing.  The two differ in kind as well as in length: the
+startup wait happens once, before anything has been said to the model, and the
+per-request wait happens mid-conversation, after the model has already been
+answered and only the tool is missing.
 
 ## Minimal sandbox
 
@@ -195,6 +272,8 @@ def run(tool, args):                                 # every arg value is a str
         return p.returncode == 0, (p.stdout + p.stderr).decode("utf-8", "replace")
     return False, "not implemented by this sandbox: " + tool
 
+frame({"id": 0, "type": "log", "text": "py-sandbox 0.1 ready"})    # before reading stdin
+
 while True:
     header = inp.readline()
     if not header:
@@ -208,9 +287,12 @@ while True:
            "result" if ok else "error": text})
 ```
 
-Three traps in that loop are worth naming, because each one is a silent hang or a
+Four traps in that loop are worth naming, because each one is a silent hang or a
 dead session rather than a message:
 
+- Send the startup notice **before** reading stdin.  A sandbox that greets the
+  agent only once it has a request is never asked for one: the agent waits for
+  the notice and the sandbox waits for the request.
 - Anything printed to stdout outside `frame()` corrupts the stream and ends the
   session; diagnostics belong on stderr.
 - Read the header and the payload from the **same** stream.  A text-mode

@@ -9390,15 +9390,18 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
  * file-global and the child is started before the engine opens.  That ordering
  * matters: /bin/sh always exists, so posix_spawn() succeeds even when the
  * command itself cannot run, and the shell reports "not found" only a few
- * milliseconds later.  Waiting out that window turns a minutes-long failure
- * into an instant one.
+ * milliseconds later.  The startup handshake then waits for the sandbox to say
+ * it is ready, so that no model is loaded for a sandbox that does not exist; a
+ * command that dies or breaks the protocol is still reported in milliseconds.
  *
  * stdin stays open for requests and stdout carries responses.  stderr is the
  * child's own diagnostics: the contract with a sandbox is that it folds the
  * stderr of the work it performs into the result text it reports, so nothing
  * out of band can reach the conversation.  Agent stderr is drained continuously,
  * kept only as a short tail, mirrored to a sibling of --trace when that is set,
- * and surfaced when the sandbox fails.
+ * and surfaced when the sandbox fails.  Startup stderr is the one exception: the
+ * lines before the ready notice are echoed, because that is where a misconfigured
+ * command explains itself.
  *
  * The reader thread is not an optimization, it is what keeps the child from
  * stalling: a pipe holds roughly 64 KiB, so a child that prints more than that
@@ -9414,7 +9417,6 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 #define AGENT_SANDBOX_ERR_TAIL 4096
 #define AGENT_SANDBOX_REPORT_BYTES 200
 #define AGENT_SANDBOX_ENV_VALUE 4096
-#define AGENT_SANDBOX_SPAWN_GRACE_SEC 0.25
 #define AGENT_SANDBOX_STOP_GRACE_SEC 1.0
 #define AGENT_SANDBOX_POLL_MS 50
 #define AGENT_SANDBOX_WAIT_MS 5
@@ -9443,6 +9445,13 @@ typedef struct {
     char err[AGENT_SANDBOX_ERR_TAIL + 1];  /* newest stderr bytes */
     size_t err_len;
     bool err_truncated;
+    bool ready;         /* a notice said ready */
+    char *ready_text;   /* that notice's text, kept for the caller */
+    bool request_sent;  /* a request has left: a later answer can be abandoned */
+    bool handshaking;   /* startup stderr is echoed until the notice arrives */
+    char line[AGENT_SANDBOX_ERR_TAIL];     /* stderr bytes with no newline yet */
+    size_t line_len;
+    bool line_overflow;
     bool dead;          /* both pipes drained and the child reaped */
     int exit_status;
     char fault[128];    /* output could not be handled */
@@ -9450,8 +9459,20 @@ typedef struct {
 
 static agent_sandbox *g_sandbox;
 
-/* Declared here because the startup probe tears down a command that dies
- * inside the grace window, before the teardown is defined below. */
+/* Set by the handler the startup wait installs.  A sandbox that stays alive and
+ * never says ready is waited for as long as it lives, so an agent interrupted
+ * during that wait has to leave it through the teardown that reaches the process
+ * group, rather than through the default disposition that would leave the child
+ * running. */
+static volatile sig_atomic_t g_sandbox_interrupted;
+
+static void agent_sandbox_interrupt(int sig) {
+    (void)sig;
+    g_sandbox_interrupted = 1;
+}
+
+/* Declared here because a startup that fails tears the child down before the
+ * teardown itself is defined below. */
 static void agent_sandbox_stop(void);
 /* Also used while buffering stdout, before the framing code that defines it. */
 static void agent_sandbox_fault(agent_sandbox *sb, const char *fmt, ...);
@@ -9491,6 +9512,49 @@ static void agent_sandbox_note_stderr(agent_sandbox *sb, const char *p, size_t n
         sb->err_len += n;
     }
     sb->err[sb->err_len] = '\0';
+}
+
+/* mu held, and only while the handshake is open.  Complete startup stderr lines
+ * are echoed with a prefix so that a command which is missing or misconfigured
+ * says so on the terminal instead of only in a trace file nobody opens.  A line
+ * that never ends is dropped once it is past the tail size, and is not echoed
+ * even then: the spec echoes lines, and a partial line is not one. */
+static void agent_sandbox_echo_stderr(agent_sandbox *sb, const char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c = p[i];
+        if (c == '\n') {
+            sb->line[sb->line_len] = '\0';
+            if (!sb->line_overflow) fprintf(stderr, "sandbox: %s\n", sb->line);
+            sb->line_len = 0;
+            sb->line_overflow = false;
+            continue;
+        }
+        if (c == '\r') continue;
+        if (sb->line_len + 1 < sizeof(sb->line)) sb->line[sb->line_len++] = c;
+        else sb->line_overflow = true;
+    }
+    fflush(stderr);
+}
+
+/* The word ready anywhere in a notice's text, ASCII case-insensitive.  Matching
+ * the word rather than a schema is what lets a sandbox put its version, its caps
+ * and its working directory in one sentence the user can read, and lets a newer
+ * implementation call the notice something else in `type`. */
+static bool agent_sandbox_says_ready(const char *text) {
+    static const char word[] = "ready";
+    if (!text) return false;
+    for (const char *p = text; *p; p++) {
+        const char *w = word;
+        const char *c = p;
+        while (*w) {
+            char ch = *c >= 'A' && *c <= 'Z' ? (char)(*c + ('a' - 'A')) : *c;
+            if (ch != *w) break;
+            w++;
+            c++;
+        }
+        if (!*w) return true;
+    }
+    return false;
 }
 
 /* mu held.  Buffer response bytes until framing can consume them, and fault
@@ -9536,6 +9600,9 @@ static void agent_sandbox_fault(agent_sandbox *sb, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(sb->fault, sizeof(sb->fault), fmt, ap);
     va_end(ap);
+    /* The fault is the diagnosis the user needs, so startup stops echoing
+     * whatever the sandbox prints after it. */
+    sb->handshaking = false;
     if (sb->want_id) agent_sandbox_answer(sb, false, xstrdup(sb->fault));
 }
 
@@ -9613,9 +9680,29 @@ static void agent_sandbox_handle_frame(agent_sandbox *sb, const char *payload,
 
     if (id == 0) {
         int text_idx = json_args_find_unused(&args, "text");
-        agent_sandbox_log_notice(sb, text_idx >= 0 ? args.v[text_idx].value : doc);
+        const char *text = text_idx >= 0 ? args.v[text_idx].value : doc;
+        agent_sandbox_log_notice(sb, text);
+        /* The first notice that says ready is the startup handshake, and it ends
+         * the wait.  Later notices are diagnostics again, and only the first
+         * hello is kept for the caller to print. */
+        if (!sb->ready && agent_sandbox_says_ready(text)) {
+            sb->ready = true;
+            sb->handshaking = false;
+            sb->ready_text = xstrdup(text);
+        }
         json_args_free(&args);
         free(doc);
+        return;
+    }
+
+    /* Nothing has been asked yet, so a response cannot be an answer to anything:
+     * the sandbox has misunderstood the protocol, which is worth saying now
+     * rather than waiting out a hello that this proves is never coming.  It is
+     * not fatal later, when an abandoned request can legitimately turn up. */
+    if (!sb->request_sent) {
+        json_args_free(&args);
+        free(doc);
+        agent_sandbox_fault(sb, "sandbox answered before the agent sent a request");
         return;
     }
 
@@ -9746,6 +9833,8 @@ static void *agent_sandbox_reader(void *arg) {
                             agent_sandbox_frames(sb);
                         } else {
                             agent_sandbox_note_stderr(sb, buf, (size_t)n);
+                            if (sb->handshaking)
+                                agent_sandbox_echo_stderr(sb, buf, (size_t)n);
                             if (sb->log) {
                                 fwrite(buf, 1, (size_t)n, sb->log);
                                 fflush(sb->log);
@@ -9801,8 +9890,11 @@ static void *agent_sandbox_reader(void *arg) {
 }
 
 /* Why the sandbox is unusable: exit status or signal, plus the newest stderr
- * bytes, which is where a shell reports that the command does not exist. */
-static void agent_sandbox_reason(agent_sandbox *sb, char *out, size_t outlen) {
+ * bytes, which is where a shell reports that the command does not exist.
+ * include_stderr is false only for a startup failure, whose stderr the user has
+ * already been shown line by line. */
+static void agent_sandbox_reason(agent_sandbox *sb, char *out, size_t outlen,
+                                 bool include_stderr) {
     char base[160];
     char detail[AGENT_SANDBOX_REPORT_BYTES + 8];
     size_t n = 0;
@@ -9815,7 +9907,7 @@ static void agent_sandbox_reason(agent_sandbox *sb, char *out, size_t outlen) {
         snprintf(base, sizeof(base), "exited with status %d",
                  WEXITSTATUS(sb->exit_status));
     else snprintf(base, sizeof(base), "closed its output");
-    if (sb->err_len) {
+    if (include_stderr && sb->err_len) {
         if (sb->err_truncated) {
             memcpy(detail, "...", 3);
             n = 3;
@@ -9847,7 +9939,7 @@ static bool agent_sandbox_failed(char *why, size_t whylen) {
     bool failed = sb->dead || sb->fault[0] != '\0';
     pthread_mutex_unlock(&sb->mu);
     if (!failed) return false;
-    agent_sandbox_reason(sb, why, whylen);
+    agent_sandbox_reason(sb, why, whylen, true);
     return true;
 }
 
@@ -9903,6 +9995,11 @@ static bool agent_sandbox_write_frame(agent_sandbox *sb, const char *json,
             return false;
         }
     }
+    /* From the first request on, an answer for an id nobody is waiting on is a
+     * late reply to an abandoned call rather than a sandbox inventing answers. */
+    pthread_mutex_lock(&sb->mu);
+    sb->request_sent = true;
+    pthread_mutex_unlock(&sb->mu);
     return true;
 }
 
@@ -10167,9 +10264,13 @@ static int agent_sandbox_spawn(pid_t *pid, const int in[2], const int out[2],
     return rc;
 }
 
-/* Starts the sandbox, or fills err and returns false.  A command that cannot
- * run is reported here rather than later: /bin/sh exits 127 within a few
- * milliseconds, and this runs before the model is loaded. */
+/* Starts the sandbox and waits for its startup notice, or fills err and returns
+ * false.  A command that cannot run is reported here rather than later: /bin/sh
+ * exits 127 within a few milliseconds, a command that breaks the protocol faults
+ * on the first bytes of its hello, and all of this happens before the model is
+ * loaded.  A sandbox that stays alive and says nothing is waited for as long as
+ * it lives, which is the trade the protocol makes so that a loaded model always
+ * has a working sandbox behind it. */
 static bool agent_sandbox_start(const char *cmd, const char *trace_path,
                                 char *err, size_t errlen) {
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err_pipe[2] = {-1, -1};
@@ -10189,6 +10290,7 @@ static bool agent_sandbox_start(const char *cmd, const char *trace_path,
     memset(sb, 0, sizeof(*sb));
     pthread_mutex_init(&sb->mu, NULL);
     sb->in_fd = sb->out_fd = sb->err_fd = -1;
+    sb->handshaking = true;
     int rc = agent_sandbox_move_above(in[0], &in[0]) ||
              agent_sandbox_move_above(in[1], &in[1]) ||
              agent_sandbox_move_above(out[0], &out[0]) ||
@@ -10239,16 +10341,68 @@ static bool agent_sandbox_start(const char *cmd, const char *trace_path,
      * SIGPIPE, killing the agent instead of returning EPIPE. */
     signal(SIGPIPE, SIG_IGN);
 
-    double deadline = now_sec() + AGENT_SANDBOX_SPAWN_GRACE_SEC;
-    while (!agent_sandbox_dead(sb) && now_sec() < deadline) usleep(10000);
-    if (agent_sandbox_dead(sb)) {
-        char why[512];
-        agent_sandbox_reason(sb, why, sizeof(why));
-        snprintf(err, errlen, "sandbox command failed: %s", why);
-        agent_sandbox_stop();
-        return false;
+    /* Blocking startup handshake.  The reader thread owns both pipes, so this
+     * waits on what it records instead of reading anything itself.  A death or a
+     * broken stream ends it at once, which keeps the instant failure a missing
+     * command always had; what is left unbounded is a live sandbox that says
+     * nothing, and an interrupt is what a user has for that. */
+    struct sigaction handler, old_int, old_term;
+    memset(&handler, 0, sizeof(handler));
+    sigemptyset(&handler.sa_mask);
+    handler.sa_handler = agent_sandbox_interrupt;
+    g_sandbox_interrupted = 0;
+    sigaction(SIGINT, &handler, &old_int);
+    sigaction(SIGTERM, &handler, &old_term);
+
+    enum { SB_HELLO, SB_GONE, SB_INTERRUPTED } outcome = SB_GONE;
+    char why[512] = {0};
+    char *hello = NULL;
+    for (;;) {
+        bool ready = false, faulted = false;
+        pthread_mutex_lock(&sb->mu);
+        if (sb->ready) {
+            ready = true;
+            hello = sb->ready_text;   /* taken, so the teardown does not */
+            sb->ready_text = NULL;
+        } else {
+            faulted = sb->fault[0] != '\0';
+        }
+        pthread_mutex_unlock(&sb->mu);
+        if (ready) {
+            outcome = SB_HELLO;
+            break;
+        }
+        if (faulted || agent_sandbox_dead(sb)) {
+            /* No stderr tail: every line the sandbox wrote during the handshake
+             * was already echoed, and repeating it here would only double it. */
+            agent_sandbox_reason(sb, why, sizeof(why), false);
+            break;
+        }
+        if (g_sandbox_interrupted) {
+            outcome = SB_INTERRUPTED;
+            break;
+        }
+        usleep(AGENT_SANDBOX_WAIT_MS * 1000);
     }
-    return true;
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+
+    if (outcome == SB_HELLO) {
+        /* The one line the sandbox is allowed to the user: it says the sandbox is
+         * there, in its own words.  Diagnostics after it stay off the terminal. */
+        fprintf(stderr, "sandbox: %s\n", hello ? hello : "ready");
+        fflush(stderr);
+        free(hello);
+        return true;
+    }
+    free(hello);
+    agent_sandbox_stop();
+    if (outcome == SB_INTERRUPTED)
+        snprintf(err, errlen, "interrupted while the sandbox was starting");
+    else
+        snprintf(err, errlen, "sandbox command failed: %s",
+                 why[0] ? why : "no startup notice");
+    return false;
 }
 
 /* Closes the sandbox.  Ending its stdin lets a well-behaved command finish by
@@ -10276,6 +10430,7 @@ static void agent_sandbox_stop(void) {
     if (sb->log) fclose(sb->log);
     free(sb->out);
     free(sb->answer);
+    free(sb->ready_text);
     pthread_mutex_destroy(&sb->mu);
     free(sb);
 }
