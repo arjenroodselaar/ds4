@@ -11387,13 +11387,6 @@ static char *agent_format_user_prompt_echo(const char *text) {
     return agent_buf_take(&b);
 }
 
-static void agent_echo_user_prompt(const char *text) {
-    char *msg = agent_format_user_prompt_echo(text);
-    printf("%s", msg);
-    fflush(stdout);
-    free(msg);
-}
-
 /* ============================================================================
  * Terminal Prompt, Status Footer, And Async Output Rendering
  * ============================================================================
@@ -11701,6 +11694,7 @@ typedef struct {
     int prompt_row;
     int reserved_rows;   /* Sticky: never shrinks while the terminal size holds. */
     int status_row;      /* Absolute row the footer is pinned to. */
+    int output_anchor_row; /* Row the saved output cursor sits on, 0 = unknown. */
     bool output_cursor_saved;
     bool output_at_scroll_boundary;
     agent_input_buf deferred_output;
@@ -12056,6 +12050,10 @@ static void editor_save_output_cursor(agent_editor *ed) {
     if (!ed->scroll_region) return;
     write_all(STDOUT_FILENO, "\0337", 2);
     ed->output_cursor_saved = true;
+    /* Output is only ever appended at the bottom of the region, so the saved
+     * cursor sits on that row.  The layout code overrides this when it parks the
+     * cursor somewhere else on purpose. */
+    ed->output_anchor_row = ed->output_bottom;
 }
 
 static void editor_restore_output_cursor(agent_editor *ed) {
@@ -12137,6 +12135,8 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
         reserved_rows = ed->reserved_rows;
     }
 
+    int prev_output_bottom = ed->output_bottom;
+    bool same_size = ed->term_rows == rows && ed->term_cols == cols;
     int output_bottom = rows - reserved_rows;
     int prompt_row = output_bottom + 1;
     int footer_row = status_rows > 0 ? rows - status_rows + 1 : 0;
@@ -12185,8 +12185,17 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
     int output_col = ed->output_line_open ? ed->output_col + 1 : 1;
     if (output_col < 1) output_col = 1;
     if (output_col > cols) output_col = cols;
-    editor_csi_cursor(output_bottom, output_col);
+    /* Growing the region does not put anything on its new bottom row: the last
+     * line written is still on the old one.  Leave the saved output cursor on
+     * that row so the next output continues below it and fills the rows the
+     * prompt block handed back, instead of leaving them blank. */
+    int anchor_row = output_bottom;
+    if (same_size && prev_output_bottom > 0 && output_bottom > prev_output_bottom &&
+        ed->output_anchor_row > 0 && ed->output_anchor_row <= output_bottom)
+        anchor_row = ed->output_anchor_row;
+    editor_csi_cursor(anchor_row, output_col);
     editor_save_output_cursor(ed);
+    ed->output_anchor_row = anchor_row;
     editor_move_to_prompt_row(ed);
     return true;
 }
@@ -12327,6 +12336,10 @@ static void editor_stop(agent_editor *ed) {
      * linenoiseEditStop() left, and relayouting now would move that cursor onto
      * the row the next prompt is drawn on, erasing what is printed there. */
     ed->reserved_rows = 0;
+    /* Slash commands print with plain printf, which moves the terminal cursor
+     * without moving the saved output cursor, so forget the anchor row until the
+     * next write through the editor puts it somewhere we know. */
+    ed->output_anchor_row = 0;
     if (ed->old_stdin_flags >= 0) fcntl(STDIN_FILENO, F_SETFL, ed->old_stdin_flags);
     free(ed->edit.buf);
     ed->input = NULL;
@@ -13500,7 +13513,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     linenoiseHistoryAdd(cmd);
                     linenoiseHistorySave(hist);
                     if (worker_submit(&worker, cmd)) {
-                        agent_echo_user_prompt(cmd);
+                        char *echo = agent_format_user_prompt_echo(cmd);
+                        editor_write_scroll_output_preserve_prompt(&editor, echo,
+                                                                   strlen(echo), true);
+                        free(echo);
                     } else {
                         restore_line = xstrdup(cmd);
                     }
