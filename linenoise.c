@@ -114,6 +114,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <stdint.h>
 #include "linenoise.h"
@@ -124,10 +126,29 @@ static struct {
     int fd, depth;
 } terminal_update;
 
+/* A pty on macOS fails a single write() larger than 1024 bytes, and giving up
+ * on that error silently dropped the end of the frame: the style reset, the
+ * autowrap restore and the cursor position.  What stayed on screen was a
+ * prompt drawn in the status bar's colours with the terminal cursor left on
+ * the footer row, until the next refresh rewrote everything.  Write pieces
+ * that always fit, and wait for a full buffer instead of abandoning it. */
+#define TERMINAL_WRITE_MAX 1024
+
 static int terminalWrite(int fd, const char *text, size_t len) {
     while (len) {
-        ssize_t n = write(fd, text, len);
+        size_t chunk = len < TERMINAL_WRITE_MAX ? len : TERMINAL_WRITE_MAX;
+        ssize_t n = write(fd, text, chunk);
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set writable;
+            struct timeval timeout;
+            FD_ZERO(&writable);
+            FD_SET(fd, &writable);
+            timeout.tv_sec = 5;
+            timeout.tv_usec = 0;
+            if (select(fd + 1, NULL, &writable, NULL, &timeout) <= 0) return -1;
+            continue;
+        }
         if (n <= 0) { if (!n) errno = EIO; return -1; }
         text += n;
         len -= (size_t)n;
