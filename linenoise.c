@@ -1688,6 +1688,32 @@ static void linenoiseGotoCleanBottom(struct abuf *ab, struct linenoiseState *l,
     }
 }
 
+/* Erase the block written by the previous refresh.  When its bottom row is
+ * known, every row is cleared through an absolute address: after the terminal
+ * lost rows to a smaller window those addresses clamp to the last row, while an
+ * upward walk would leave the reserved area and wipe output lines that were
+ * never copied into the scrollback. */
+static void linenoiseCleanBlockUp(struct abuf *ab, struct linenoiseState *l,
+                                  int old_total_rows, int rpos, char *seq,
+                                  size_t seqsize) {
+    int n, j;
+
+    linenoiseGotoCleanBottom(ab, l, old_total_rows, rpos, seq, seqsize);
+    if (l->screen_cursor_row > 0) {
+        int bottom = l->screen_cursor_row + (old_total_rows - rpos);
+        for (j = 0; j < old_total_rows; j++) {
+            if (bottom - j < 1) break;
+            n = snprintf(seq, seqsize, "\x1b[%d;1H\x1b[0K", bottom - j);
+            abAppend(ab, seq, (size_t)n);
+        }
+        return;
+    }
+
+    for (j = 0; j < old_total_rows - 1; j++)
+        abAppend(ab, "\r\x1b[0K\x1b[1A", 9);
+    if (old_total_rows > 0) abAppend(ab, "\r\x1b[0K", 5);
+}
+
 /* Draw the prompt block as one row per line of input.  Returns -1 if this
  * refresh is not the multi-line renderer's to handle, in which case nothing has
  * been written and the caller draws it the way it always did. */
@@ -1732,7 +1758,7 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
     char seq[64];
     struct abuf ab;
     abInit(&ab);
-    int fd = l->ofd, j;
+    int fd = l->ofd;
 
     /* Clearing follows the single-line and multi-line paths exactly: go to the
      * bottom of the block written last time, clear upwards, clear the top. */
@@ -1740,11 +1766,7 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
         int old_total_rows = (int)l->oldrows + (int)l->oldstatusgap +
                              (int)l->oldstatusrows;
         int rpos = l->oldrpos;
-        linenoiseGotoCleanBottom(&ab, l, old_total_rows, rpos, seq, sizeof(seq));
-        for (j = 0; j < old_total_rows - 1; j++)
-            abAppend(&ab, "\r\x1b[0K\x1b[1A", 9);
-        if (old_total_rows > 0)
-            abAppend(&ab, "\r\x1b[0K", 5);
+        linenoiseCleanBlockUp(&ab, l, old_total_rows, rpos, seq, sizeof(seq));
     }
 
     /* Let the owner resize and reposition the reserved area before drawing, as
@@ -1987,7 +2009,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     int old_rows = l->oldrows;
     int old_status_rows = l->oldstatusrows;
     int old_total_rows = old_rows + old_status_rows + (int)l->oldstatusgap;
-    int fd = l->ofd, j;
+    int fd = l->ofd;
     struct abuf ab;
 
     if (linenoiseRenderBuffer(l,&render,&render_len,&render_pos) == -1) return;
@@ -2004,24 +2026,10 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     abInit(&ab);
 
     if (flags & REFRESH_CLEAN) {
-        linenoiseGotoCleanBottom(&ab, l, old_total_rows, rpos, seq, sizeof(seq));
-
-        /* Now for every row clear it, go up. */
-        for (j = 0; j < old_total_rows-1; j++) {
-            lndebug("clear+up");
-            snprintf(seq,64,"\r\x1b[0K\x1b[1A");
-            abAppend(&ab,seq,strlen(seq));
-        }
-
-        /* Clear the top row too.  The status/footer path uses multiline
-         * refresh even for a single prompt row; without this final clear,
-         * linenoiseHide() leaves the accepted prompt+input visible and the
-         * caller's next prompt appears duplicated below it. */
-        if (old_total_rows > 0) {
-            lndebug("clear top");
-            snprintf(seq,64,"\r\x1b[0K");
-            abAppend(&ab,seq,strlen(seq));
-        }
+        /* Clear every row the previous block occupied, including the footer
+         * row; otherwise the accepted prompt stays visible and the caller's
+         * next prompt appears duplicated below it. */
+        linenoiseCleanBlockUp(&ab, l, old_total_rows, rpos, seq, sizeof(seq));
     }
 
     /* Some multiplexed users, such as ds4-agent, keep linenoise in a reserved

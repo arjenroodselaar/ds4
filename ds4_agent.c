@@ -13072,6 +13072,7 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
     }
 
     int prev_output_bottom = ed->output_bottom;
+    int prev_rows = ed->term_rows;
     bool same_size = ed->term_rows == rows && ed->term_cols == cols;
     int output_bottom = rows - reserved_rows;
     int prompt_row = output_bottom + 1;
@@ -13084,18 +13085,21 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
                    ed->status_row != footer_row;
     if (!changed) return true;
 
-    /* If the prompt grows, rows that were output rows become prompt rows.  Do
-     * not simply clear them: first scroll the old output region upward by the
-     * number of newly reserved rows, exactly as if the model had printed more
-     * lines.  Because the reservation is sticky the prompt never gives rows
-     * back to the output, so nothing has to be restored underneath it. */
+    /* Rows that stop being output rows - because the prompt grew, or because the
+     * terminal got shorter and took rows off the bottom - still hold the
+     * transcript.  Do not simply clear them: scroll the old region upward by
+     * that many rows first, exactly as if the model had printed more lines, so
+     * the lines reach the scrollback instead of being erased.  Terminals that
+     * scrolled the content themselves while shrinking only get a few blank rows
+     * between the transcript and the prompt, which later output fills in.  The
+     * reservation is sticky, so a prompt that gives rows back needs no restore. */
     bool scrolled_output = false;
-    if (scroll_on_grow &&
-        ed->term_rows == rows && ed->term_cols == cols &&
-        ed->output_bottom > 0 && output_bottom < ed->output_bottom)
+    int prev_output_last = prev_output_bottom < rows ? prev_output_bottom : rows;
+    if (prev_output_bottom > 0 && output_bottom < prev_output_last &&
+        (scroll_on_grow || rows < prev_rows))
     {
-        editor_scroll_output_up(ed->output_bottom,
-                                ed->output_bottom - output_bottom);
+        editor_scroll_output_up(prev_output_last,
+                                prev_output_last - output_bottom);
         scrolled_output = true;
     }
 
