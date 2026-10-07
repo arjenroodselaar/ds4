@@ -1053,6 +1053,15 @@ static void refreshStatusLinePart(struct abuf *ab, struct linenoiseState *l,
     abAppend(ab, "\x1b[?7h", 5);
 }
 
+/* Row the footer starts on.  An application that pins it keeps the prompt
+ * block where the output ends: the rows a shrinking block gives back then turn
+ * into blank space inside the prompt area instead of moving the transcript. */
+static int linenoiseStatusRow(struct linenoiseState *l, int block_top,
+                              int block_rows) {
+    if (l->status_row > 0) return l->status_row;
+    return block_top > 0 ? block_top + block_rows : 0;
+}
+
 static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l, int row) {
     const char *p = l->status;
     while (p && *p) {
@@ -1074,7 +1083,10 @@ int linenoiseRefreshStatus(struct linenoiseState *l) {
     int last_input_row = l->screen_cursor_row - l->oldrpos + (int)l->oldrows;
     int n = snprintf(seq, sizeof(seq), "\x1b[0m\x1b[%d;1H", last_input_row);
     abAppend(&ab, seq, n);
-    refreshStatusLine(&ab, l, last_input_row + 1);
+    /* Unpinned, the footer belongs to the row below the input block; passing a
+     * zero row count here would paint it across the prompt row instead. */
+    refreshStatusLine(&ab, l, l->status_row > 0 ? l->status_row
+                                                : last_input_row + 1);
     n = snprintf(seq, sizeof(seq), "\x1b[0m\x1b[%d;%dH", l->screen_cursor_row, l->screen_cursor_col);
     abAppend(&ab, seq, n);
     linenoiseBeginUpdate(l->ofd);
@@ -1655,6 +1667,27 @@ static int linenoiseMultilineMaxRows(struct linenoiseState *l) {
     return rows < 1 ? 1 : rows;
 }
 
+/* Emit the moves that put the cursor on the bottom row of the area written by
+ * the previous refresh, so clearing can walk upwards from there.  The tracked
+ * cursor row is used when it is known, which makes the walk immune to the
+ * layout callback repositioning the cursor while it resizes the reserved area;
+ * otherwise it falls back to the historic relative move. */
+static void linenoiseGotoCleanBottom(struct abuf *ab, struct linenoiseState *l,
+                                     int old_total_rows, int rpos, char *seq,
+                                     size_t seqsize) {
+    int n;
+    if (l->screen_cursor_row > 0) {
+        n = snprintf(seq, seqsize, "\x1b[%d;1H",
+                     l->screen_cursor_row + (old_total_rows - rpos));
+        abAppend(ab, seq, n);
+        return;
+    }
+    if (old_total_rows - rpos > 0) {
+        n = snprintf(seq, seqsize, "\x1b[%dB", old_total_rows - rpos);
+        abAppend(ab, seq, n);
+    }
+}
+
 /* Draw the prompt block as one row per line of input.  Returns -1 if this
  * refresh is not the multi-line renderer's to handle, in which case nothing has
  * been written and the caller draws it the way it always did. */
@@ -1704,12 +1737,10 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
     /* Clearing follows the single-line and multi-line paths exactly: go to the
      * bottom of the block written last time, clear upwards, clear the top. */
     if (flags & REFRESH_CLEAN) {
-        int old_total_rows = (int)l->oldrows + (int)l->oldstatusrows;
+        int old_total_rows = (int)l->oldrows + (int)l->oldstatusgap +
+                             (int)l->oldstatusrows;
         int rpos = l->oldrpos;
-        if (old_total_rows - rpos > 0) {
-            snprintf(seq, sizeof(seq), "\x1b[%dB", old_total_rows - rpos);
-            abAppend(&ab, seq, strlen(seq));
-        }
+        linenoiseGotoCleanBottom(&ab, l, old_total_rows, rpos, seq, sizeof(seq));
         for (j = 0; j < old_total_rows - 1; j++)
             abAppend(&ab, "\r\x1b[0K\x1b[1A", 9);
         if (old_total_rows > 0)
@@ -1730,6 +1761,7 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
     if (!(flags & REFRESH_WRITE)) {
         l->oldrows = 0;
         l->oldstatusrows = 0;
+        l->oldstatusgap = 0;
         l->oldrpos = 1;
         l->screen_cursor_row = 0;
         l->screen_cursor_col = 0;
@@ -1783,8 +1815,8 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
                              (size_t)map.row[content_row].width);
     }
 
-    if (statusrows > 0)
-        refreshStatusLine(&ab, l, layout_prompt_row > 0 ? layout_prompt_row + drawn_rows : 0);
+    int status_top = linenoiseStatusRow(l, layout_prompt_row, drawn_rows);
+    if (statusrows > 0) refreshStatusLine(&ab, l, status_top);
 
     if (layout_prompt_row > 0) {
         l->screen_cursor_row = layout_prompt_row + cursor_draw_row;
@@ -1810,6 +1842,8 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
     l->oldpos = l->pos;
     l->oldrows = (size_t)drawn_rows;
     l->oldstatusrows = (size_t)statusrows;
+    l->oldstatusgap = statusrows > 0 && status_top > 0 && layout_prompt_row > 0 ?
+                      status_top - (layout_prompt_row + drawn_rows) : 0;
     l->oldrpos = cursor_draw_row + 1;
 
     if (linenoiseWrite(fd, ab.b, ab.len) == -1) {}
@@ -1952,7 +1986,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     int col; /* column position, zero-based. */
     int old_rows = l->oldrows;
     int old_status_rows = l->oldstatusrows;
-    int old_total_rows = old_rows + old_status_rows;
+    int old_total_rows = old_rows + old_status_rows + (int)l->oldstatusgap;
     int fd = l->ofd, j;
     struct abuf ab;
 
@@ -1970,11 +2004,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     abInit(&ab);
 
     if (flags & REFRESH_CLEAN) {
-        if (old_total_rows-rpos > 0) {
-            lndebug("go down %d", old_total_rows-rpos);
-            snprintf(seq,64,"\x1b[%dB", old_total_rows-rpos);
-            abAppend(&ab,seq,strlen(seq));
-        }
+        linenoiseGotoCleanBottom(&ab, l, old_total_rows, rpos, seq, sizeof(seq));
 
         /* Now for every row clear it, go up. */
         for (j = 0; j < old_total_rows-1; j++) {
@@ -2047,7 +2077,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
         lndebug("rpos2 %d", rpos2);
 
         if (linenoiseStatusActive(l)) {
-            refreshStatusLine(&ab, l, layout_prompt_row > 0 ? layout_prompt_row + rows : 0);
+            refreshStatusLine(&ab, l, linenoiseStatusRow(l, layout_prompt_row, rows));
         }
 
         /* Set column. */
@@ -2085,12 +2115,17 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     lndebug("\n");
     l->oldpos = l->pos;
     if (flags & REFRESH_WRITE) {
+        int status_top = linenoiseStatusRow(l, layout_prompt_row, rows);
         l->oldrows = rows;
         l->oldstatusrows = (size_t)linenoiseStatusRows(l);
+        l->oldstatusgap = linenoiseStatusActive(l) && status_top > 0 &&
+                          layout_prompt_row > 0 ?
+                          status_top - (layout_prompt_row + rows) : 0;
         l->oldrpos = rpos2;
     } else if (flags & REFRESH_CLEAN) {
         l->oldrows = 0;
         l->oldstatusrows = 0;
+        l->oldstatusgap = 0;
         l->oldrpos = 1;
         l->screen_cursor_row = 0;
         l->screen_cursor_col = 0;
@@ -2314,6 +2349,12 @@ void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
     l->layout_privdata = privdata;
 }
 
+/* Pin the status footer to an absolute terminal row instead of the row right
+ * below the prompt block.  0 restores the default placement. */
+void linenoiseSetStatusRow(struct linenoiseState *l, int row) {
+    l->status_row = row > 0 ? row : 0;
+}
+
 static int linenoiseReadByte(struct linenoiseState *l, char *c) {
     if (l->queued_input_pos < l->queued_input_len) {
         *c = l->queued_input[l->queued_input_pos++];
@@ -2525,6 +2566,8 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->cols = getColumns(stdin_fd, stdout_fd);
     l->oldrows = 0;
     l->oldstatusrows = 0;
+    l->oldstatusgap = 0;
+    l->status_row = 0;
     l->oldrpos = 1;  /* Cursor starts on row 1. */
     l->history_index = 0;
 
@@ -2967,7 +3010,8 @@ void linenoiseEditStop(struct linenoiseState *l) {
     int had_prompt = l->oldrows != 0 || l->oldstatusrows != 0;
     if ((isatty(l->ifd) || getenv("LINENOISE_ASSUME_TTY")) && had_status) {
         char seq[64];
-        int down = (int)(l->oldrows + l->oldstatusrows) - l->oldrpos;
+        int down = (int)(l->oldrows + l->oldstatusgap + l->oldstatusrows) -
+                   l->oldrpos;
         if (down > 0) {
             int n = snprintf(seq, sizeof(seq), "\x1b[%dB", down);
             if (n > 0 && (size_t)n < sizeof(seq)) {
