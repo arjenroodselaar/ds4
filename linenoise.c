@@ -1681,17 +1681,20 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
     int total_rows = map.rows + map.extra_row;
     int statusrows = linenoiseStatusRows(l);
     int max_rows = linenoiseMultilineMaxRows(l);
-    int top = 0, shown = total_rows, markers = 0;
+    int top = 0, shown = total_rows, marker_slots = 0;
     if (max_rows > 0 && total_rows > max_rows) {
-        shown = max_rows - 2;
+        /* Both marker rows are always reserved.  Their count must not decide
+         * the block height: it did, so crossing a viewport edge grew or shrank
+         * the block by a row and the application scrolled its output region. */
+        marker_slots = max_rows >= 3 ? 2 : 0;
+        shown = max_rows - marker_slots;
         if (shown < 1) shown = 1;
         top = map.cursor_row - shown / 2;
         if (top > total_rows - shown) top = total_rows - shown;
         if (top < 0) top = 0;
-        markers = (top > 0 ? 1 : 0) + (top + shown < total_rows ? 1 : 0);
     }
-    int drawn_rows = shown + markers;
-    int cursor_draw_row = map.cursor_row - top + (top > 0 ? 1 : 0);
+    int drawn_rows = shown + marker_slots;
+    int cursor_draw_row = map.cursor_row - top + (marker_slots ? 1 : 0);
 
     char seq[64];
     struct abuf ab;
@@ -1738,8 +1741,7 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
     }
 
     for (int r = 0; r < drawn_rows; r++) {
-        int marker_row = (top > 0 && r == 0) ||
-                         (markers > (top > 0 ? 1 : 0) && r == drawn_rows - 1);
+        int marker_row = marker_slots && (r == 0 || r == drawn_rows - 1);
         if (layout_prompt_row > 0) {
             snprintf(seq, sizeof(seq), "\x1b[%d;1H\x1b[0K", layout_prompt_row + r);
             abAppend(&ab, seq, strlen(seq));
@@ -1748,18 +1750,23 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
             if (r > 0) abAppend(&ab, "\n", 1);
         }
         if (marker_row) {
-            /* The input is longer than the space the terminal has for it. */
+            /* The input is longer than the space the terminal has for it; a
+             * reserved slot with nothing hidden stays empty. */
             int hidden = (r == 0) ? top : total_rows - (top + shown);
-            snprintf(seq, sizeof(seq), "\x1b[2m... %d line%s ...\x1b[0m",
-                     hidden, hidden == 1 ? "" : "s");
-            abAppend(&ab, seq, strlen(seq));
+            if (hidden > 0) {
+                snprintf(seq, sizeof(seq), "\x1b[2m... %d line%s ...\x1b[0m",
+                         hidden, hidden == 1 ? "" : "s");
+                abAppend(&ab, seq, strlen(seq));
+            }
             continue;
         }
-        int content_row = top + r - (top > 0 ? 1 : 0);
+        int content_row = top + r - (marker_slots ? 1 : 0);
         /* A cursor at the right margin needs a row below the last one; that row
          * is cleared and holds the cursor, but there is no text to draw in it. */
         if (content_row >= map.rows) continue;
-        if (r == (top > 0 ? 1 : 0)) abAppend(&ab, l->prompt, l->plen);
+        /* The row map charged the prompt width to the first row only, so the
+         * prompt goes there and nowhere else. */
+        if (content_row == 0) abAppend(&ab, l->prompt, l->plen);
         if (maskmode == 1) {
             size_t i = map.row[content_row].start;
             size_t end = map.row[content_row].end;
@@ -1772,7 +1779,7 @@ static int linenoiseRefreshNewlines(struct linenoiseState *l, int flags) {
                      map.row[content_row].end - map.row[content_row].start);
         }
         if (content_row == top + shown - 1 || content_row == map.rows - 1)
-            refreshShowHints(&ab, l, r == (top > 0 ? 1 : 0) ? pwidth : 0,
+            refreshShowHints(&ab, l, content_row == 0 ? pwidth : 0,
                              (size_t)map.row[content_row].width);
     }
 
